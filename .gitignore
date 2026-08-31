@@ -32,9 +32,18 @@ settings.db
 settings.db-journal
 settings.db-wal
 settings.db-shm
+config.ini
 config.ini.bak
 shared_links.json
 shared_upload_links.json
+
+# Internal Development Docs & Scratch Scripts
+BUGFIX_AND_ROADMAP.md
+CHANGELOG.md
+fix_modals.ps1
+background.jpg
+source_icon.png
+project-docker/
 
 # Shared Uploads & Temp Directories
 shared_files/
