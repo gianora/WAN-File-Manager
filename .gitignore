@@ -1,0 +1,62 @@
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller artifacts
+*.manifest
+*.spec
+
+# SQLite Database & Local Configurations (Prevent leaking private PINs & Telegram Tokens)
+settings.db
+settings.db-journal
+settings.db-wal
+settings.db-shm
+config.ini.bak
+shared_links.json
+shared_upload_links.json
+
+# Shared Uploads & Temp Directories
+shared_files/
+.upload_temp/
+
+# Backup & Compressed Files
+old/
+*.bak
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# Environment & Secret files
+.env
+.env.local
+
+# IDE & OS Files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store

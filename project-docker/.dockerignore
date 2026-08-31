@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+build/
+dist/
+old/
+*.spec
+*.rar
+*.log
+venv/
+.venv/
+project-docker/data_storage/
+project-docker/data_app/

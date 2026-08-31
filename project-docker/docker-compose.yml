@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  file-station:
+    build:
+      context: ..
+      dockerfile: project-docker/Dockerfile
+    container_name: file_station
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      # 1. Mount folder penyimpanan utama yang ingin di-share/dikelola
+      # Format: "<Path_Di_Host>:/storage"
+      # Contoh Windows: - "D:/MyFiles:/storage"
+      # Contoh Linux:   - "/mnt/storage:/storage"
+      - "./data_storage:/storage"
+
+      # 2. Mount persistent data (database SQLite & link sharing JSON) agar data aman saat rebuild
+      - "./data_app:/app/data"
+    environment:
+      - TZ=Asia/Jakarta

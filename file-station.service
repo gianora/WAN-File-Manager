@@ -1,0 +1,14 @@
+[Unit]
+Description=WAN File Station Web Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/file-station
+ExecStart=/opt/file-station/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
