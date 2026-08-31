@@ -12,8 +12,26 @@ A lightweight, self-hosted, and secure **Web File Manager** built with **Python 
 
 ---
 
+## 📸 Screenshots & UI Preview
+
+<div align="center">
+  <img src="image/image%201.jpg" alt="WAN File Station Dashboard" width="100%" />
+  <p><em>Main File Manager Dashboard & Desktop-like Navigation</em></p>
+</div>
+
+<br/>
+
+<div align="center">
+  <img src="image/image%202.jpg" alt="WAN File Station Features" width="49%" />
+  <img src="image/image%203.jpg" alt="WAN File Station Settings" width="49%" />
+  <p><em>System Telemetry & In-Browser Monaco Code Editor / Settings Management</em></p>
+</div>
+
+---
+
 ## 📑 Table of Contents
 
+- [Screenshots & UI Preview](#-screenshots--ui-preview)
 - [Key Features](#-key-features)
 - [Architecture & Tech Stack](#-architecture--tech-stack)
 - [Dependencies](#-dependencies)
