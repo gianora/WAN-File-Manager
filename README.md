@@ -8,7 +8,7 @@
 
 A lightweight, self-hosted, and secure **Web File Manager** built with **Python (Flask)** and **Tailwind CSS**. Designed for local NAS, home labs, and remote office servers, WAN File Station provides a native desktop-like file management experience in the browser with dark-themed aesthetics and responsive mobile support.
 
-> 🚀 **Single-File Architecture** — The entire application is packaged within a single `app.py` script without external template directories. All HTML templates, stylesheets, and client-side logic are embedded as Python constants.
+> 🚀 **Single-File Architecture**: The entire application is packaged within a single `app.py` script without external template directories. All HTML templates, stylesheets, and client-side logic are embedded as Python constants.
 
 ---
 
@@ -53,10 +53,11 @@ A lightweight, self-hosted, and secure **Web File Manager** built with **Python 
 
 ### 📁 Advanced File Management
 - **Core Operations**: Upload, download, delete, inline rename, move files between subdirectories, and create folders.
-- **Chunked Uploading (5MB Partitions)**: Effortlessly upload multi-gigabyte files. Bypasses the **100MB Cloudflare Tunnel limit** (`HTTP 413 Entity Too Large`) and handles network interruptions smoothly.
+- **Chunked Uploading (5MB Partitions)**: Upload multi-gigabyte files reliably. Bypasses reverse proxy and Cloudflare Tunnel body limits (`HTTP 413 Entity Too Large`) with resume tolerance.
+- **Guest Upload Request Links**: Generate tokenized, time-expiring upload portals. External guests can upload files directly into designated folders without credentials.
 - **ZIP Archive Management**: Compress selected files into ZIP archives or extract ZIP files directly on the server.
 - **Bulk Operations**: Multi-select files (with `SHIFT-click` support) to perform bulk deletion or bulk compression via an interactive Floating Action Bar.
-- **Automated Versioning Backup**: Uploading a file with an identical name automatically archives the existing copy with timestamp suffix `.BAK_YYYYMMDD_HHMMSS`.
+- **Automated Versioning Backup**: Uploading a file with an identical name automatically archives the existing copy (`.BAK_YYYYMMDD_HHMMSS`) after chunk verification succeeds.
 - **Live Search & Filter**: Filter files inside any directory in real-time without reloading the webpage.
 - **Sortable Columns**: Sort files instantly by Name, Size, or Date Modified.
 
@@ -74,9 +75,13 @@ A lightweight, self-hosted, and secure **Web File Manager** built with **Python 
   2. `Upload PIN`: Required to upload files.
   3. `Edit PIN`: Required to delete, rename, move, extract, or edit files (Edit Mode).
 - **Public Sharing with QR Codes**: Generate secure, time-expiring share links for individual files or entire folders with automatic QR code generation.
-- **Path Traversal & Zip Slip Protection**: Strict validation prevents path traversal attacks and extraction of malicious archives beyond the designated root directory.
+- **Single-Use Upload Tokens**: One-time upload tokens ensure guests cannot upload repeatedly or modify existing storage.
+- **Path Traversal & Root Protection**: Strict normalization (`is_safe_path` with case normalization) blocks directory traversal (CWE-22) and protects the root directory from deletion, renaming, or movement.
+- **Zip Bomb Defense**: Maximum uncompressed extraction size cap (10 GB) mitigates decompression resource exhaustion attacks.
+- **Privacy Filtering**: Dotfiles and internal temporary directories (`.upload_temp`, `.git`) are hidden from public shares and zip exports.
+- **Telegram OTP Rate Limiting**: In-memory IP cooldown prevents spamming of the two-factor authentication endpoint.
 - **Real Client IP Detection**: Fully compatible with reverse proxies and Cloudflare Tunnels (reads `CF-Connecting-IP`, `X-Real-IP`, and `X-Forwarded-For`).
-- **File Extension Whitelisting**: Restrict allowed file extensions via settings, or leave empty to allow all file types.
+- **File Extension Whitelisting**: Restrict allowed file extensions via settings, with automatic dot prefix formatting, or leave empty to allow all file types.
 
 ### 🤖 Telegram Bot Integration (2FA & Alerts)
 - **Two-Factor Authentication (OTP Login)**: Request a 6-digit one-time password delivered directly to your private Telegram chat (5-minute expiry).
@@ -162,6 +167,9 @@ pywin32>=306; sys_platform == 'win32'
 | `GET` | `/share/<token>` | Public | Browse or preview a shared file/folder |
 | `GET` | `/download/<token>` | Public | Direct download for shared file |
 | `GET` | `/zip_folder/<token>` | Public | Download entire shared folder as ZIP |
+| `POST` | `/generate_upload_link` | `@login_required` | Create single-use tokenized upload request link |
+| `GET` | `/upload_request/<token>` | Public | Web portal interface for guest file uploads |
+| `POST` | `/upload_request/<token>/chunk` | Public | 5MB chunked upload handler for upload requests |
 | `POST` | `/api/save_text` | `@login_required` | Save file content from Monaco Editor |
 | `GET` | `/system_stats` | `@login_required` | Returns CPU, RAM, Disk, and Connection metrics |
 | `GET` | `/network_config` | `@login_required` | Returns network interface adapters and gateway info |
@@ -223,13 +231,13 @@ Automate the deployment as a 24/7 background service on Ubuntu Server:
 ---
 
 ### Option 4: Compiling Standalone `.exe` via PyInstaller
-To package `app.py` into a single, self-contained Windows executable:
+To compile `FileStation.exe` using the official build specification file (`FileStation.spec`):
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --noconsole --name "FileStation" --icon=icon.ico --collect-all psutil --collect-all waitress --hidden-import=psutil --hidden-import=waitress --hidden-import=pystray --hidden-import=PIL --hidden-import=win32api --hidden-import=flask --hidden-import=sqlite3 --clean --noconfirm app.py
+python -m PyInstaller FileStation.spec --clean
 ```
-The compiled executable will be generated at `dist/FileStation.exe`.
+The specification file pre-bundles the system tray runtime (`pystray`, `pillow`), production WSGI server (`waitress`), system telemetry (`psutil`), application icon (`icon.ico`), and default wallpaper asset (`image.jpg`). The compiled standalone binary will be generated at `dist/FileStation.exe`.
 
 ---
 
@@ -264,10 +272,10 @@ When running File Station for the first time, use the default credentials:
 Distributed under the MIT License. See `LICENSE` for more information.
 
 ### Acknowledgments & Libraries
-- **[Flask](https://flask.palletsprojects.com/)** — Web Framework
-- **[Waitress](https://docs.pylonsproject.org/projects/waitress/)** — Production WSGI Server
-- **[Monaco Editor](https://microsoft.github.io/monaco-editor/)** — Microsoft Code Editor
-- **[Tailwind CSS](https://tailwindcss.com/)** — Utility-first CSS Framework
-- **[Chart.js](https://www.chartjs.org/)** — Data Visualization
-- **[Bootstrap Icons](https://icons.getbootstrap.com/)** — UI Icon Library
-- **[psutil](https://github.com/giampaolo/psutil)** — Cross-Platform System Process Utilities
+- **[Flask](https://flask.palletsprojects.com/)** - Web Framework
+- **[Waitress](https://docs.pylonsproject.org/projects/waitress/)** - Production WSGI Server
+- **[Monaco Editor](https://microsoft.github.io/monaco-editor/)** - Microsoft Code Editor
+- **[Tailwind CSS](https://tailwindcss.com/)** - Utility-first CSS Framework
+- **[Chart.js](https://www.chartjs.org/)** - Data Visualization
+- **[Bootstrap Icons](https://icons.getbootstrap.com/)** - UI Icon Library
+- **[psutil](https://github.com/giampaolo/psutil)** - Cross-Platform System Process Utilities
