@@ -9,7 +9,7 @@ import shutil
 import platform
 import psutil
 import re
-from flask import Flask, send_from_directory, render_template_string, request, redirect, url_for, abort, session, flash, jsonify
+from flask import Flask, send_from_directory, render_template_string, request, redirect, url_for, abort, session, flash, jsonify, Response
 from werkzeug.utils import secure_filename
 from waitress import serve
 from PIL import Image
@@ -237,7 +237,19 @@ def start_temp_cleanup_scheduler(interval_seconds=3600, max_age_hours=12):
 start_temp_cleanup_scheduler()
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+
+def get_or_create_secret_key():
+    key = get_setting("flask_secret_key", "")
+    if not key:
+        key = secrets.token_hex(32)
+        set_setting("flask_secret_key", key)
+    return key
+
+app.secret_key = get_or_create_secret_key()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax'
+)
 
 def get_real_client_ip():
     """Mencoba mendapatkan IP asli user di balik Proxy/Cloudflare"""
@@ -793,7 +805,9 @@ UPLOAD_REQUEST_TEMPLATE = """
 @app.route("/generate_upload_link", methods=["POST"])
 @login_required
 def generate_upload_link():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+    if data.get("folder_path") is None:
+        return jsonify({"success": False, "message": "Folder path not provided."}), 400
     rel_path = data.get("folder_path", "")
     expiry_date = data.get("expiry_date")
     
@@ -919,8 +933,8 @@ def upload_request_chunk(token):
 @app.route("/upload_chunk", methods=["POST"])
 @login_required
 def upload_chunk():
-    pin = request.form.get("pin")
-    if pin != upload_pin:
+    pin = request.form.get("pin", "")
+    if not upload_pin or not secrets.compare_digest(str(pin), str(upload_pin)):
         logging.warning(f"Incorrect PIN for chunked upload: {pin}")
         return jsonify({"success": False, "message": "Incorrect PIN! Access denied."}), 403
 
@@ -1083,14 +1097,17 @@ def public_upload_request(token):
 @app.route("/generate_share_link", methods=["POST"])
 @login_required
 def generate_share_link():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     rel_path = data.get("file_path")
     expiry_date = data.get("expiry_date") # Format: YYYY-MM-DD or None
     if not rel_path:
         return jsonify({"success": False, "message": "File path not provided."}), 400
     
     # Clean rel_path
-    rel_path = rel_path.replace("\\", "/")
+    rel_path = rel_path.replace("\\", "/").lstrip("/")
+    target_abs_path = os.path.abspath(os.path.join(directory, rel_path))
+    if not is_safe_path(directory, target_abs_path) or not os.path.exists(target_abs_path):
+        return jsonify({"success": False, "message": "Invalid or unauthorized file path."}), 400
     
     links = load_shared_links()
     
@@ -1343,30 +1360,54 @@ def zip_folder(token, subpath=""):
         
     zip_filename = f"{folder_name}.zip"
     
-    import io
-    memory_file = io.BytesIO()
-    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for root, dirs, files_in_dir in os.walk(target_abs_path):
-            for file in files_in_dir:
-                ext = os.path.splitext(file)[1].lower()
-                if not is_allowed_extension(ext, allow_zip=True):
-                    continue
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, target_abs_path)
-                zip_file.write(file_path, arcname)
-                
-    memory_file.seek(0)
-    
-    client_ip = get_real_client_ip()
-    send_telegram_notification(f"{zip_filename} (ZIP)", client_ip)
-    
-    from flask import send_file
-    return send_file(
-        memory_file,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name=zip_filename
-    )
+    import tempfile
+
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_zip_path = temp_zip.name
+    temp_zip.close()
+
+    try:
+        with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for root, dirs, files_in_dir in os.walk(target_abs_path):
+                for file in files_in_dir:
+                    ext = os.path.splitext(file)[1].lower()
+                    if not is_allowed_extension(ext, allow_zip=True):
+                        continue
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, target_abs_path)
+                    zip_file.write(file_path, arcname)
+
+        client_ip = get_real_client_ip()
+        send_telegram_notification(f"{zip_filename} (ZIP)", client_ip)
+
+        def stream_and_cleanup():
+            try:
+                with open(temp_zip_path, 'rb') as f_zip:
+                    while True:
+                        chunk = f_zip.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                if os.path.exists(temp_zip_path):
+                    try:
+                        os.remove(temp_zip_path)
+                    except Exception as ex:
+                        logging.warning(f"Failed to delete temp zip {temp_zip_path}: {ex}")
+
+        file_size = os.path.getsize(temp_zip_path)
+        resp = Response(stream_and_cleanup(), mimetype='application/zip')
+        resp.headers['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
+        resp.headers['Content-Length'] = str(file_size)
+        return resp
+    except Exception as e:
+        if os.path.exists(temp_zip_path):
+            try:
+                os.remove(temp_zip_path)
+            except Exception:
+                pass
+        logging.error(f"Failed to generate zip for shared folder: {e}")
+        abort(500)
 
 
 HTML_TEMPLATE = """
@@ -5084,11 +5125,11 @@ LOGIN_TEMPLATE = """
 @app.route("/toggle_edit_mode", methods=["POST"])
 @login_required
 def toggle_edit_mode():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     action = data.get("action")
-    pin = data.get("pin")
+    pin = data.get("pin", "")
     if action == "activate":
-        if pin == edit_pin:
+        if edit_pin and secrets.compare_digest(str(pin), str(edit_pin)):
             session["edit_mode_active"] = True
             logging.info("Edit mode activated via PIN.")
             return jsonify({"success": True})
@@ -5322,12 +5363,15 @@ def login():
                 flash("Internal session error. Please try again.", "danger")
                 return render_template_string(LOGIN_TEMPLATE, current_year=datetime.now().year)
                 
-            if otp_input == stored_otp:
+            if otp_input and stored_otp and secrets.compare_digest(str(otp_input), str(stored_otp)):
                 session.pop("login_otp", None)
                 session.pop("login_otp_expiry", None)
                 session["logged_in"] = True
                 send_login_notification("SUCCESS✅ (Telegram OTP)", client_ip, user_agent)
-                return redirect(request.args.get("next") or url_for("list_files"))
+                next_url = request.args.get("next")
+                if not next_url or not next_url.startswith("/") or next_url.startswith("//") or "\\" in next_url:
+                    next_url = url_for("list_files")
+                return redirect(next_url)
             else:
                 send_login_notification("❌FAILED (Wrong OTP)❌", client_ip, user_agent)
                 flash("Invalid OTP code.", "danger")
@@ -5335,10 +5379,13 @@ def login():
 
         else: # Standard PIN
             pin = request.form.get("pin", "")
-            if pin == login_pin:
+            if login_pin and secrets.compare_digest(str(pin), str(login_pin)):
                 session["logged_in"] = True
                 send_login_notification("SUCCESS✅ (PIN)", client_ip, user_agent)
-                return redirect(request.args.get("next") or url_for("list_files"))
+                next_url = request.args.get("next")
+                if not next_url or not next_url.startswith("/") or next_url.startswith("//") or "\\" in next_url:
+                    next_url = url_for("list_files")
+                return redirect(next_url)
             else:
                 send_login_notification("❌FAILED (Wrong PIN)❌", client_ip, user_agent)
                 flash("Access denied: Incorrect PIN.", "danger")
@@ -5398,7 +5445,7 @@ def get_system_stats():
             except Exception as e:
                 logging.warning(f"Failed to read Windows OS details from Registry: {e}")
                 os_version = platform.platform()
-        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_percent = psutil.cpu_percent(interval=None)
         cpu_cores = psutil.cpu_count(logical=True)
         ram_info = psutil.virtual_memory()
         ram_total_gb = round(ram_info.total / GB, 2)
@@ -5477,6 +5524,10 @@ def list_files(req_path):
         logging.warning(f"Unauthorized access attempt: {abs_path}")
         abort(403)
     if os.path.isfile(abs_path):
+        ext = os.path.splitext(abs_path)[1].lower()
+        if not is_allowed_extension(ext, allow_zip=True):
+            logging.warning(f"Direct access blocked for disallowed extension ({ext}): {abs_path}")
+            abort(403)
         as_attachment = request.args.get('preview') != '1'
         return send_from_directory(os.path.dirname(abs_path), os.path.basename(abs_path), as_attachment=as_attachment)
     if not os.path.isdir(abs_path):
@@ -5520,8 +5571,8 @@ def upload_file():
     if "file" not in request.files or "pin" not in request.form or "target_path" not in request.form:
         flash("File, PIN, and target path must be included.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
-    pin = request.form["pin"]
-    if pin != upload_pin:
+    pin = request.form.get("pin", "")
+    if not upload_pin or not secrets.compare_digest(str(pin), str(upload_pin)):
         logging.warning(f"Incorrect PIN for upload: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
@@ -5588,7 +5639,7 @@ def delete_file():
         if not pin:
             flash("PIN is required.", "danger")
             return redirect(url_for("list_files"))
-        if pin != edit_pin:
+        if not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin)):
             logging.warning(f"Incorrect PIN for file deletion: {pin}")
             flash("Incorrect PIN! Access denied.", "danger")
             return redirect(url_for("list_files"))
@@ -5639,7 +5690,7 @@ def bulk_delete():
         if not pin:
             flash("PIN is required.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
-        if pin != edit_pin:
+        if not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin)):
             logging.warning(f"Incorrect PIN for bulk deletion: {pin}")
             flash("Incorrect PIN! Access denied.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5697,7 +5748,7 @@ def bulk_compress():
         if not pin:
             flash("PIN is required.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
-        if pin != edit_pin:
+        if not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin)):
             logging.warning(f"Incorrect PIN for bulk compression: {pin}")
             flash("Incorrect PIN! Access denied.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5756,7 +5807,7 @@ def rename_file():
         if not pin:
              flash("PIN is required.", "danger")
              return redirect(url_for("list_files"))
-        if pin != edit_pin:
+        if not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin)):
             logging.warning(f"Incorrect PIN for file renaming: {pin}")
             flash("Incorrect PIN! Access denied.", "danger")
             return redirect(url_for("list_files"))
@@ -5812,7 +5863,7 @@ def new_folder():
     if not raw_folder_name or not pin:
         flash("Folder name and PIN must be included.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
-    if not session.get("edit_mode_active") and pin != edit_pin:
+    if not session.get("edit_mode_active") and (not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin))):
         logging.warning(f"Incorrect PIN for creating a folder: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
@@ -5851,7 +5902,7 @@ def move_file():
     if not source_rel or not destination_rel or not pin:
         flash("Source path, destination folder, and PIN must be included.", "danger")
         return redirect(url_for("list_files"))
-    if not session.get("edit_mode_active") and pin != edit_pin:
+    if not session.get("edit_mode_active") and (not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin))):
         logging.warning(f"Incorrect PIN for file move: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         current_path_rel = os.path.dirname(source_rel).replace(os.sep, "/")
@@ -5905,7 +5956,7 @@ def compress_file():
     if not target_rel or not output_name or not pin:
         flash("Target path, output name, and PIN must be provided.", "danger")
         return redirect(url_for("list_files"))
-    if not session.get("edit_mode_active") and pin != edit_pin:
+    if not session.get("edit_mode_active") and (not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin))):
         logging.warning(f"Incorrect PIN for compression: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files"))
@@ -5949,7 +6000,7 @@ def extract_file():
     if not archive_rel or not destination_rel or not pin:
         flash("Archive path, destination folder, and PIN must be provided.", "danger")
         return redirect(url_for("list_files"))
-    if not session.get("edit_mode_active") and pin != edit_pin:
+    if not session.get("edit_mode_active") and (not edit_pin or not secrets.compare_digest(str(pin), str(edit_pin))):
         logging.warning(f"Incorrect PIN for extraction: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files"))
@@ -6233,6 +6284,7 @@ SETTINGS_HTML = """
 """
 
 @app.route('/settings', methods=['GET', 'POST'])
+@login_required
 def settings_dashboard():
     if not session.get('edit_mode_active'):
         flash("You must activate Edit Mode to access Settings.", "danger")
@@ -6247,9 +6299,24 @@ def settings_dashboard():
         set_setting('directory', new_dir)
         set_setting('allowed_extensions', request.form.get('allowed_extensions', ''))
         
-        set_setting('login_pin', request.form.get('login_pin', ''))
-        set_setting('upload_pin', request.form.get('upload_pin', ''))
-        set_setting('edit_pin', request.form.get('edit_pin', ''))
+        new_login_pin = request.form.get('login_pin', '').strip()
+        new_upload_pin = request.form.get('upload_pin', '').strip()
+        new_edit_pin = request.form.get('edit_pin', '').strip()
+        
+        if new_login_pin:
+            set_setting('login_pin', new_login_pin)
+        else:
+            flash("Login PIN cannot be empty; previous PIN retained.", "warning")
+            
+        if new_upload_pin:
+            set_setting('upload_pin', new_upload_pin)
+        else:
+            flash("Upload PIN cannot be empty; previous PIN retained.", "warning")
+            
+        if new_edit_pin:
+            set_setting('edit_pin', new_edit_pin)
+        else:
+            flash("Edit PIN cannot be empty; previous PIN retained.", "warning")
         
         set_setting('tg_bot_token', request.form.get('tg_bot_token', ''))
         set_setting('tg_chat_id', request.form.get('tg_chat_id', ''))
@@ -6275,28 +6342,37 @@ def settings_dashboard():
     return render_template_string(SETTINGS_HTML, config=current_config)
 
 @app.route('/api/save_text', methods=['POST'])
+@login_required
 def save_text():
     if not session.get('edit_mode_active'):
         return jsonify({'success': False, 'message': 'Edit mode is not active'}), 403
     
-    data = request.get_json()
-    req_path = data.get('req_path')
+    data = request.get_json(silent=True) or {}
+    req_path = data.get('req_path') or data.get('file_path')
     content = data.get('content')
     
     if not req_path:
         return jsonify({'success': False, 'message': 'No path provided'}), 400
+    if content is None:
+        content = ""
         
-    abs_path = os.path.join(get_setting('directory'), req_path)
-    if not is_safe_path(get_setting('directory'), abs_path):
+    clean_req_path = req_path.lstrip("/\\")
+    base_dir = get_setting('directory', 'shared_files')
+    abs_path = os.path.abspath(os.path.join(base_dir, clean_req_path))
+    if not is_safe_path(base_dir, abs_path):
         return jsonify({'success': False, 'message': 'Unauthorized path'}), 403
+        
+    _, ext = os.path.splitext(abs_path)
+    if not is_allowed_extension(ext):
+        return jsonify({'success': False, 'message': 'File type is not allowed'}), 403
         
     try:
         with open(abs_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        logging.info(f"File updated via web editor: {req_path}")
+        logging.info(f"File updated via web editor: {clean_req_path}")
         return jsonify({'success': True, 'message': 'File saved successfully'})
     except Exception as e:
-        logging.error(f"Failed to save file {req_path}: {e}")
+        logging.error(f"Failed to save file {clean_req_path}: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == "__main__":
