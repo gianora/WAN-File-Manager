@@ -69,3 +69,11 @@ old/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Agent, Antislop & Scratch Files
+.agents/
+AGENTS.md
+antislop.md
+PANDUAN_ANTISLOP.md
+anti-slop/
+scratch/

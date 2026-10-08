@@ -8,7 +8,9 @@ import time
 import shutil
 import platform
 import psutil
+import re
 from flask import Flask, send_from_directory, render_template_string, request, redirect, url_for, abort, session, flash, jsonify
+from werkzeug.utils import secure_filename
 from waitress import serve
 from PIL import Image
 from functools import wraps
@@ -19,17 +21,12 @@ import json
 import secrets
 import urllib.parse
 import urllib.request
-import html  # Sanitasi HTML
-
-# --- TAMBAHAN UNTUK FITUR NETWORK ---
+import html
 import socket 
 import struct
 import ipaddress 
-# -------------------------------------
-# --- TAMBAHAN UNTUK FITUR EVENT LOG ---
 import subprocess 
-from datetime import datetime, timedelta 
-# -------------------------------------
+from datetime import datetime, timedelta
 if platform.system() == "Windows":
     import winreg 
 
@@ -60,6 +57,20 @@ def is_safe_path(base_dir, path, follow_symlinks=True):
         return base == matchpath or matchpath.startswith(base + os.sep)
     except Exception:
         return False
+def get_secure_filename(filename):
+    """Sanitasi nama file dari Path Traversal (CWE-22) dengan fallback karakter UTF-8."""
+    if not filename:
+        return ""
+    clean = filename.replace("\x00", "").replace("\\", "/")
+    base = os.path.basename(clean).strip()
+    sec = secure_filename(base)
+    _, orig_ext = os.path.splitext(base)
+    if sec and (not orig_ext or sec.endswith(orig_ext.lower())):
+        return sec
+    safe_chars = re.sub(r'[\/\\:\*\?\"<>\|\x00-\x1f]', '_', base)
+    while '..' in safe_chars:
+        safe_chars = safe_chars.replace('..', '')
+    return safe_chars.strip(' ._')
 
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
@@ -146,7 +157,6 @@ def set_setting(key, value):
 
 init_db_and_migrate()
 
-# --- LOAD KONFIGURASI GLOBAL ---
 host = get_setting("host", "0.0.0.0")
 port = int(get_setting("port", "5000"))
 raw_dir = get_setting("directory", "shared_files").strip()
@@ -157,7 +167,6 @@ edit_pin = get_setting("edit_pin", "5678")
 raw_extensions = get_setting("allowed_extensions", ".txt,.jpg,.png")
 ALLOWED_EXTENSIONS = set(ext.strip().lower() for ext in raw_extensions.split(",") if ext.strip().startswith("."))
 
-# --- LOAD KONFIGURASI TELEGRAM ---
 tg_bot_token = get_setting("tg_bot_token", "")
 tg_chat_id = get_setting("tg_chat_id", "")
 tg_enabled = get_setting("tg_enabled", "False").lower() in ["true", "1", "yes"]
@@ -194,7 +203,6 @@ def is_allowed_extension(ext, allow_zip=False):
         return True
     return ext in ALLOWED_EXTENSIONS
 
-# --- HELPER & THREAD: AUTOMATIC CLEANUP OF TEMP UPLOADS ---
 def cleanup_temp_uploads(max_age_hours=12):
     """Cleans up orphaned chunked upload folders older than max_age_hours."""
     temp_dir = os.path.join(directory, ".upload_temp")
@@ -227,35 +235,23 @@ def start_temp_cleanup_scheduler(interval_seconds=3600, max_age_hours=12):
     t.start()
 
 start_temp_cleanup_scheduler()
-# ---------------------------------------------------------
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# --- HELPER: DETEKSI IP ASLI (CLOUDFARE/PROXY SUPPORT) ---
 def get_real_client_ip():
     """Mencoba mendapatkan IP asli user di balik Proxy/Cloudflare"""
     try:
-        # 1. Cek Header Cloudflare (Paling Akurat jika pakai Cloudflare Tunnel)
         if request.headers.get('CF-Connecting-IP'):
             return request.headers.get('CF-Connecting-IP')
-        
-        # 2. Cek Header X-Real-IP (Standar Nginx/Proxy lain)
         if request.headers.get('X-Real-IP'):
             return request.headers.get('X-Real-IP')
-        
-        # 3. Cek X-Forwarded-For (Bisa berupa list IP, ambil yang pertama)
         if request.headers.get('X-Forwarded-For'):
-            # Format: client, proxy1, proxy2... ambil client (index 0)
             return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-        
-        # 4. Fallback ke alamat remote biasa (Lokal/Langsung)
         return request.remote_addr
     except Exception:
         return request.remote_addr
-# ---------------------------------------------------------
 
-# --- FUNGSI PENGIRIM NOTIFIKASI TELEGRAM ---
 def send_telegram_notification(filename, remote_ip):
     if not tg_enabled or not tg_bot_token or not tg_chat_id:
         return        
@@ -296,10 +292,7 @@ def send_telegram_notification(filename, remote_ip):
             logging.error(f"Failed to send Telegram notification: {e}")
 
     threading.Thread(target=_send, daemon=True).start()
-# -----------------------------------------------------
 
-
-# Masukkan di bawah fungsi send_telegram_notification (Baris ~113)
 
 def send_login_notification(status, remote_ip, browser_info="N/A"):
     """Sends a Telegram notification regarding login access details"""
@@ -440,7 +433,7 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
-# --- SHARED LINKS MANAGEMENT ---
+# Shared links
 SHARED_LINKS_FILE = os.path.join(APP_DIR, "shared_links.json")
 
 def load_shared_links():
@@ -460,7 +453,7 @@ def save_shared_links(links):
     except Exception as e:
         logging.error(f"Error saving {SHARED_LINKS_FILE}: {e}")
 
-# --- SHARED UPLOAD LINKS MANAGEMENT ---
+# Shared upload links
 SHARED_UPLOAD_LINKS_FILE = os.path.join(APP_DIR, "shared_upload_links.json")
 
 def load_shared_upload_links():
@@ -509,51 +502,49 @@ UPLOAD_REQUEST_TEMPLATE = """
             z-index: 0;
         }
         .glass-card {
-            background: rgba(15, 23, 42, 0.45);
-            backdrop-filter: blur(25px) saturate(200%);
-            -webkit-backdrop-filter: blur(25px) saturate(200%);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 32px 80px rgba(0,0,0,0.6), 0 0 0 0.5px rgba(255,255,255,0.05);
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            box-shadow: 0 16px 40px rgba(0,0,0,0.4);
         }
         .dropzone {
-            border: 2px dashed rgba(255, 255, 255, 0.15);
-            background: rgba(255, 255, 255, 0.02);
-            transition: all 0.3s ease;
+            border: 2px dashed rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.03);
+            transition: all 0.2s ease;
         }
         .dropzone.dragover {
             border-color: #3b82f6;
-            background: rgba(59, 130, 246, 0.05);
-            box-shadow: 0 0 15px rgba(59, 130, 246, 0.1);
+            background: rgba(59, 130, 246, 0.08);
         }
         .btn-gradient {
-            background: linear-gradient(135deg, #2563eb 0%, #4f46e5 100%);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: #2563eb;
+            color: #ffffff;
+            transition: all 0.2s ease;
         }
         .btn-gradient:hover {
-            background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
-            box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.4);
+            background: #1d4ed8;
             transform: translateY(-1px);
         }
         .btn-gradient:active {
-            transform: translateY(1px) scale(0.98);
+            transform: translateY(1px);
         }
         @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
+            from { opacity: 0; transform: translateY(6px); }
             to { opacity: 1; transform: translateY(0); }
         }
         .animate-fade-in {
-            animation: fadeIn 0.4s ease forwards;
+            animation: fadeIn 0.3s ease forwards;
         }
     </style>
 </head>
 <body class="p-4 antialiased font-sans relative">
     <div class="w-full max-w-[500px] relative z-10 animate-fade-in">
-        <div class="glass-card rounded-3xl overflow-hidden p-8 sm:p-10">
+        <div class="glass-card rounded-2xl overflow-hidden p-8 sm:p-10">
             <!-- Header Section -->
             <div class="text-center mb-8">
-                <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 shadow-lg shadow-blue-500/20 mb-5 relative">
-                    <div class="absolute inset-0 rounded-2xl bg-blue-500/25 blur-md"></div>
-                    <i class="bi bi-cloud-arrow-up text-3xl text-white relative z-10"></i>
+                <div class="inline-flex items-center justify-center w-14 h-14 rounded-xl bg-blue-600 text-white mb-4">
+                    <i class="bi bi-cloud-arrow-up text-2xl"></i>
                 </div>
                 <h1 class="text-2xl font-bold text-white tracking-tight">Upload Request</h1>
                 <p class="text-slate-400 text-sm mt-2">You have been requested to upload a file to:</p>
@@ -572,7 +563,7 @@ UPLOAD_REQUEST_TEMPLATE = """
             <!-- Main Upload Section -->
             <div id="uploadSection" class="space-y-6">
                 <!-- Dropzone Area -->
-                <div id="dropzone" class="dropzone rounded-2xl p-8 text-center cursor-pointer flex flex-col items-center justify-center">
+                <div id="dropzone" class="dropzone rounded-xl p-8 text-center cursor-pointer flex flex-col items-center justify-center">
                     <input type="file" id="fileInput" class="hidden">
                     <i class="bi bi-cloud-upload text-4xl text-slate-400 mb-3" id="uploadIcon"></i>
                     <p class="text-sm font-semibold text-white mb-1">Drag & drop a file here</p>
@@ -586,15 +577,15 @@ UPLOAD_REQUEST_TEMPLATE = """
                 </div>
 
                 <!-- Progress Section -->
-                <div id="progressContainer" class="hidden space-y-2 bg-slate-950/40 p-4 rounded-2xl border border-white/5">
+                <div id="progressContainer" class="hidden space-y-2 bg-slate-950/40 p-4 rounded-xl border border-white/5">
                     <div class="flex justify-between text-xs font-bold text-slate-300">
                         <span id="currentFileName" class="truncate max-w-[70%]">Uploading...</span>
                         <span id="progressPercent">0%</span>
                     </div>
                     <div class="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
-                        <div id="progressBar" class="bg-gradient-to-r from-blue-500 to-indigo-500 h-2.5 rounded-full transition-all duration-150" style="width: 0%"></div>
+                        <div id="progressBar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-150" style="width: 0%"></div>
                     </div>
-                    <p id="progressDetail" class="text-[10px] text-slate-500 text-right mt-1">0 / 0 MB</p>
+                    <p id="progressDetail" class="text-[10px] text-slate-400 text-right mt-1">0 / 0 MB</p>
                 </div>
 
                 <!-- Action Button -->
@@ -649,7 +640,7 @@ UPLOAD_REQUEST_TEMPLATE = """
         const progressDetail = document.getElementById('progressDetail');
 
         let selectedFile = null;
-        const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB Chunks
+        const CHUNK_SIZE = 10 * 1024 * 1024;
 
         // Trigger file browse on click
         dropzone.addEventListener('click', () => fileInput.click());
@@ -811,7 +802,7 @@ def generate_upload_link():
         rel_path = rel_path[:-1]
     
     target_abs_path = os.path.abspath(os.path.join(directory, rel_path))
-    if not target_abs_path.startswith(directory) or not os.path.isdir(target_abs_path):
+    if not is_safe_path(directory, target_abs_path) or not os.path.isdir(target_abs_path):
         return jsonify({"success": False, "message": "Invalid or unauthorized folder path."}), 400
     
     links = load_shared_upload_links()
@@ -844,45 +835,60 @@ def upload_request_chunk(token):
     target_rel_path = link_info.get("rel_path")
     
     file_chunk = request.files.get("file")
-    filename = request.form.get("filename")
+    raw_filename = request.form.get("filename")
     chunk_index = int(request.form.get("chunk_index", 0))
     total_chunks = int(request.form.get("total_chunks", 1))
-    upload_id = request.form.get("upload_id")
+    raw_upload_id = request.form.get("upload_id")
 
-    if not file_chunk or not filename or not upload_id:
+    if not file_chunk or not raw_filename or not raw_upload_id:
         return jsonify({"success": False, "message": "Missing required upload parameters."}), 400
+
+    filename = get_secure_filename(raw_filename)
+    if not filename:
+        return jsonify({"success": False, "message": "Invalid filename."}), 400
+
+    upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', raw_upload_id)
+    if not upload_id:
+        return jsonify({"success": False, "message": "Invalid upload ID."}), 400
 
     ext = os.path.splitext(filename)[1].lower()
     if not is_allowed_extension(ext):
         return jsonify({"success": False, "message": "File type is not allowed."}), 400
 
     target_abs_path = os.path.abspath(os.path.join(directory, target_rel_path))
-    if not target_abs_path.startswith(directory):
+    if not is_safe_path(directory, target_abs_path):
         return jsonify({"success": False, "message": "Unauthorized upload path."}), 403
+
+    file_path = os.path.abspath(os.path.join(target_abs_path, filename))
+    if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
+        return jsonify({"success": False, "message": "Unauthorized file path."}), 403
 
     os.makedirs(target_abs_path, exist_ok=True)
     
     temp_dir = os.path.join(directory, ".upload_temp")
     os.makedirs(temp_dir, exist_ok=True)
     
-    upload_temp_dir = os.path.join(temp_dir, upload_id)
+    upload_temp_dir = os.path.abspath(os.path.join(temp_dir, upload_id))
+    if not is_safe_path(temp_dir, upload_temp_dir):
+        return jsonify({"success": False, "message": "Unauthorized temporary path."}), 403
     os.makedirs(upload_temp_dir, exist_ok=True)
     
     chunk_filename = f"{chunk_index}.part"
-    chunk_path = os.path.join(upload_temp_dir, chunk_filename)
+    chunk_path = os.path.abspath(os.path.join(upload_temp_dir, chunk_filename))
+    if not is_safe_path(upload_temp_dir, chunk_path):
+        return jsonify({"success": False, "message": "Unauthorized chunk path."}), 403
     file_chunk.save(chunk_path)
     
     if chunk_index == total_chunks - 1:
-        file_path = os.path.join(target_abs_path, filename)
-        
         if os.path.exists(file_path):
             try:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 base, ext = os.path.splitext(filename)
                 backup_filename = f"{base}.BAK_{timestamp}{ext}"
-                backup_path = os.path.join(target_abs_path, backup_filename)
-                shutil.move(file_path, backup_path)
-                logging.info(f"Existing file backed up to: {backup_filename}")
+                backup_path = os.path.abspath(os.path.join(target_abs_path, backup_filename))
+                if is_safe_path(target_abs_path, backup_path):
+                    shutil.move(file_path, backup_path)
+                    logging.info(f"Existing file backed up to: {backup_filename}")
             except Exception as e:
                 logging.error(f"Failed to backup existing file {filename}: {e}")
                 shutil.rmtree(upload_temp_dir, ignore_errors=True)
@@ -919,46 +925,61 @@ def upload_chunk():
         return jsonify({"success": False, "message": "Incorrect PIN! Access denied."}), 403
 
     file_chunk = request.files.get("file")
-    filename = request.form.get("filename")
+    raw_filename = request.form.get("filename")
     chunk_index = int(request.form.get("chunk_index", 0))
     total_chunks = int(request.form.get("total_chunks", 1))
     target_path = request.form.get("target_path", "").strip().replace("/", os.sep)
-    upload_id = request.form.get("upload_id")
+    raw_upload_id = request.form.get("upload_id")
 
-    if not file_chunk or not filename or not upload_id:
+    if not file_chunk or not raw_filename or not raw_upload_id:
         return jsonify({"success": False, "message": "Missing required upload parameters."}), 400
+
+    filename = get_secure_filename(raw_filename)
+    if not filename:
+        return jsonify({"success": False, "message": "Invalid filename."}), 400
+
+    upload_id = re.sub(r'[^a-zA-Z0-9_\-]', '', raw_upload_id)
+    if not upload_id:
+        return jsonify({"success": False, "message": "Invalid upload ID."}), 400
 
     ext = os.path.splitext(filename)[1].lower()
     if not is_allowed_extension(ext):
         return jsonify({"success": False, "message": "File type is not allowed."}), 400
 
     target_abs_path = os.path.abspath(os.path.join(directory, target_path))
-    if not target_abs_path.startswith(directory):
+    if not is_safe_path(directory, target_abs_path):
         return jsonify({"success": False, "message": "Unauthorized upload path."}), 403
+
+    file_path = os.path.abspath(os.path.join(target_abs_path, filename))
+    if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
+        return jsonify({"success": False, "message": "Unauthorized file path."}), 403
 
     os.makedirs(target_abs_path, exist_ok=True)
     
     temp_dir = os.path.join(directory, ".upload_temp")
     os.makedirs(temp_dir, exist_ok=True)
     
-    upload_temp_dir = os.path.join(temp_dir, upload_id)
+    upload_temp_dir = os.path.abspath(os.path.join(temp_dir, upload_id))
+    if not is_safe_path(temp_dir, upload_temp_dir):
+        return jsonify({"success": False, "message": "Unauthorized temporary path."}), 403
     os.makedirs(upload_temp_dir, exist_ok=True)
     
     chunk_filename = f"{chunk_index}.part"
-    chunk_path = os.path.join(upload_temp_dir, chunk_filename)
+    chunk_path = os.path.abspath(os.path.join(upload_temp_dir, chunk_filename))
+    if not is_safe_path(upload_temp_dir, chunk_path):
+        return jsonify({"success": False, "message": "Unauthorized chunk path."}), 403
     file_chunk.save(chunk_path)
     
     if chunk_index == total_chunks - 1:
-        file_path = os.path.join(target_abs_path, filename)
-        
         if os.path.exists(file_path):
             try:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 base, ext = os.path.splitext(filename)
                 backup_filename = f"{base}.BAK_{timestamp}{ext}"
-                backup_path = os.path.join(target_abs_path, backup_filename)
-                shutil.move(file_path, backup_path)
-                logging.info(f"Existing file backed up to: {backup_filename}")
+                backup_path = os.path.abspath(os.path.join(target_abs_path, backup_filename))
+                if is_safe_path(target_abs_path, backup_path):
+                    shutil.move(file_path, backup_path)
+                    logging.info(f"Existing file backed up to: {backup_filename}")
             except Exception as e:
                 logging.error(f"Failed to backup existing file {filename}: {e}")
                 shutil.rmtree(upload_temp_dir, ignore_errors=True)
@@ -1088,7 +1109,6 @@ def generate_share_link():
     save_shared_links(links)
     return jsonify({"success": True, "token": new_token})
 
-# --- Helper: Check Link Expiry ---
 def is_link_expired(token_info):
     expiry = token_info.get("expiry")
     if not expiry:
@@ -1101,7 +1121,7 @@ def is_link_expired(token_info):
     except Exception:
         return False
 
-# --- Endpoint Publik untuk Share Link (LOGIK TOKEN DI GUNAKAN) ---
+# Public share route
 @app.route("/share/<token>", defaults={"subpath": ""})
 @app.route("/share/<token>/<path:subpath>")
 def public_share(token, subpath=""):
@@ -1142,7 +1162,7 @@ def public_share(token, subpath=""):
     base_rel_path = links[token].get("rel_path")
     base_abs_path = os.path.abspath(os.path.join(directory, base_rel_path))
     
-    if not base_abs_path.startswith(directory) or not os.path.exists(base_abs_path):
+    if not is_safe_path(directory, base_abs_path) or not os.path.exists(base_abs_path):
         abort(404)
     
     # Target path inside the shared folder
@@ -1152,12 +1172,12 @@ def public_share(token, subpath=""):
     else:
         target_abs_path = base_abs_path
 
-    if not target_abs_path.startswith(base_abs_path) or not os.path.exists(target_abs_path):
+    if not is_safe_path(base_abs_path, target_abs_path) or not os.path.exists(target_abs_path):
         abort(403)
         
     expiry_date = links[token].get("expiry", "Unlimited") or "Unlimited"
     
-    # JIKA JALUR ADALAH DIREKTORI (FOLDER SHARING)
+    # Directory sharing
     if os.path.isdir(target_abs_path):
         items = []
         for item in os.listdir(target_abs_path):
@@ -1182,10 +1202,8 @@ def public_share(token, subpath=""):
                 "rel_path": item_rel
             })
         
-        # Urutkan: Folder dulu, lalu File
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         
-        # Hitung parent path
         parent_subpath = ""
         if clean_subpath:
             parts = clean_subpath.split("/")
@@ -1208,7 +1226,7 @@ def public_share(token, subpath=""):
             current_subpath=clean_subpath
         )
 
-    # JIKA JALUR ADALAH FILE
+    # Single file sharing
     ext = os.path.splitext(target_abs_path)[1].lower()
     if not is_allowed_extension(ext):
         logging.warning(f"Public share: Blocked disallowed file: {clean_subpath}")
@@ -1243,7 +1261,7 @@ def direct_download(token):
     rel_path = links[token].get("rel_path")
     abs_path = os.path.abspath(os.path.join(directory, rel_path))
     
-    if not abs_path.startswith(directory) or not os.path.isfile(abs_path):
+    if not is_safe_path(directory, abs_path) or not os.path.isfile(abs_path):
         abort(404)
     
     ext = os.path.splitext(abs_path)[1].lower()
@@ -1271,14 +1289,14 @@ def download_from_folder(token, filename):
     base_rel_path = links[token].get("rel_path")
     base_abs_path = os.path.abspath(os.path.join(directory, base_rel_path))
     
-    if not base_abs_path.startswith(directory) or not os.path.isdir(base_abs_path):
+    if not is_safe_path(directory, base_abs_path) or not os.path.isdir(base_abs_path):
         abort(404)
     
     # Jalur file spesifik di dalam folder tersebut
     file_abs_path = os.path.abspath(os.path.join(base_abs_path, filename))
     
     # Keamanan: Pastikan file masih berada di dalam folder yang di-share
-    if not file_abs_path.startswith(base_abs_path) or not os.path.isfile(file_abs_path):
+    if not is_safe_path(base_abs_path, file_abs_path) or not os.path.isfile(file_abs_path):
         abort(403)
         
     ext = os.path.splitext(file_abs_path)[1].lower()
@@ -1307,7 +1325,7 @@ def zip_folder(token, subpath=""):
     base_rel_path = links[token].get("rel_path")
     base_abs_path = os.path.abspath(os.path.join(directory, base_rel_path))
     
-    if not base_abs_path.startswith(directory) or not os.path.isdir(base_abs_path):
+    if not is_safe_path(directory, base_abs_path) or not os.path.isdir(base_abs_path):
         abort(404)
         
     clean_subpath = subpath.strip("/").replace("\\", "/")
@@ -1316,7 +1334,7 @@ def zip_folder(token, subpath=""):
     else:
         target_abs_path = base_abs_path
         
-    if not target_abs_path.startswith(base_abs_path) or not os.path.isdir(target_abs_path):
+    if not is_safe_path(base_abs_path, target_abs_path) or not os.path.isdir(target_abs_path):
         abort(403)
         
     folder_name = os.path.basename(target_abs_path)
@@ -1349,9 +1367,8 @@ def zip_folder(token, subpath=""):
         as_attachment=True,
         download_name=zip_filename
     )
-# --- AKHIR: Share Link Endpoint ---
 
-# --- START HTML_TEMPLATE ---
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1362,6 +1379,7 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script>
@@ -1428,8 +1446,8 @@ HTML_TEMPLATE = """
         }
 
         .glass-sidebar {
-            background: rgba(16, 20, 28, 0.2);
-            border-right: 1px solid rgba(255,255,255,0.05);
+            background: rgba(16, 20, 28, 0.75);
+            border-right: 1px solid rgba(255,255,255,0.08);
         }
 
         .glass-toolbar {
@@ -1479,32 +1497,38 @@ HTML_TEMPLATE = """
         /* Buttons */
         .btn-glass {
             background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.12);
             color: #e2e8f0;
-            transition: all 0.2s cubic-bezier(0.4,0,0.2,1);
-            backdrop-filter: blur(10px);
+            transition: all 0.15s ease;
         }
         .btn-glass:hover {
             background: rgba(255,255,255,0.12);
-            border-color: rgba(255,255,255,0.2);
+            border-color: rgba(255,255,255,0.22);
             transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
         }
-        .btn-glass:active { transform: translateY(0) scale(0.97); }
+        .btn-glass:active { transform: translateY(0); }
+        .btn-glass:focus-visible {
+            outline: 2px solid #5865f2;
+            outline-offset: 2px;
+        }
 
         .btn-accent {
-            background: linear-gradient(135deg, #5865f2 0%, #7c85f5 100%);
+            background: #5865f2;
             border: 1px solid rgba(255,255,255,0.15);
             color: white;
-            transition: all 0.2s cubic-bezier(0.4,0,0.2,1);
-            box-shadow: 0 4px 15px rgba(88,101,242,0.3);
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
         }
         .btn-accent:hover {
-            background: linear-gradient(135deg, #6674ff 0%, #8b94f8 100%);
-            box-shadow: 0 6px 20px rgba(88,101,242,0.45);
+            background: #4752c4;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
             transform: translateY(-1px);
         }
-        .btn-accent:active { transform: translateY(0) scale(0.97); }
+        .btn-accent:active { transform: translateY(0); }
+        .btn-accent:focus-visible {
+            outline: 2px solid #ffffff;
+            outline-offset: 2px;
+        }
 
         /* File item */
         .file-item {
@@ -1538,42 +1562,50 @@ HTML_TEMPLATE = """
 
         /* Column header */
         .col-header {
-            background: rgba(16,20,28,0.9);
-            border-bottom: 1px solid rgba(255,255,255,0.06);
+            background: rgba(16,20,28,0.95);
+            border-bottom: 1px solid rgba(255,255,255,0.08);
             font-size: 11px;
             font-weight: 600;
             letter-spacing: 0.05em;
             text-transform: uppercase;
-            color: #7d8590;
+            color: #94a3b8;
         }
 
         /* Path bar */
         .path-bar {
-            background: rgba(13,17,23,0.8);
-            border-bottom: 1px solid rgba(255,255,255,0.04);
+            background: rgba(13,17,23,0.85);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
         }
 
         /* Status bar */
         .status-bar {
             background: rgba(10,13,18,0.95);
-            backdrop-filter: blur(20px);
+            backdrop-filter: blur(12px);
             border-top: 1px solid rgba(255,255,255,0.05);
         }
 
         /* Input glass */
         .input-glass {
             background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.12);
             color: #e2e8f0;
             transition: all 0.2s;
         }
         .input-glass:focus {
-            border-color: rgba(88,101,242,0.6);
-            box-shadow: 0 0 0 3px rgba(88,101,242,0.15);
-            background: rgba(255,255,255,0.07);
-            outline: none;
+            border-color: #5865f2;
+            box-shadow: 0 0 0 2px rgba(88,101,242,0.25);
+            background: rgba(255,255,255,0.08);
         }
-        .input-glass::placeholder { color: #4d5566; }
+        .input-glass:focus-visible {
+            outline: 2px solid #5865f2;
+            outline-offset: 1px;
+        }
+        .input-glass::placeholder { color: #8b949e; }
+
+        button:focus-visible, a:focus-visible {
+            outline: 2px solid #5865f2;
+            outline-offset: 2px;
+        }
 
         /* Flash alerts */
         .flash-success { background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.25); color: #6ee7b7; }
@@ -1776,7 +1808,7 @@ HTML_TEMPLATE = """
             <!-- Glass Sidebar -->
             <div class="w-56 shrink-0 glass-sidebar py-3 overflow-y-auto hidden md:flex md:flex-col">
                 <div class="px-4 pb-2 pt-1">
-                    <p class="text-xs font-bold uppercase tracking-widest" style="color:#4d5566;letter-spacing:0.1em;">Navigation</p>
+                    <p class="text-xs font-bold uppercase tracking-widest" style="color:#8b949e;letter-spacing:0.1em;">Navigation</p>
                 </div>
                 <div class="sidebar-item active flex items-center gap-3 text-slate-200">
                     <i class="bi bi-folder-fill text-base" style="color:#f59e0b;"></i>
@@ -1845,12 +1877,12 @@ HTML_TEMPLATE = """
                     <div class="text-xs font-medium truncate flex items-center gap-1.5" style="color:#c9d1d9;">
                         <i class="bi bi-geo-alt-fill" style="color:#5865f2;"></i>
                         {% set path_parts = req_path.split('/') if req_path else [] %}
-                        <a href="{{ url_for('list_files', req_path='') }}" class="hover:text-white transition-colors" style="color:#7d8590;">Shared Root</a>
+                        <a href="{{ url_for('list_files', req_path='') }}" class="hover:text-white transition-colors" style="color:#94a3b8;">Shared Root</a>
                         {% set current_build = [] %}
                         {% for part in path_parts %}
                             {% if part %}
                                 {% set _ = current_build.append(part) %}
-                                <i class="bi bi-chevron-right" style="color:#4d5566; font-size:10px;"></i>
+                                <i class="bi bi-chevron-right" style="color:#6e7681; font-size:10px;"></i>
                                 <a href="{{ url_for('list_files', req_path='/'.join(current_build)) }}" class="hover:text-white transition-colors {% if loop.last %}text-slate-200 font-semibold{% else %}text-slate-400{% endif %}">
                                     {{ part }}
                                 </a>
@@ -1934,26 +1966,26 @@ HTML_TEMPLATE = """
                             </div>
                             <!-- Name column: 70% on mobile, 42% on desktop -->
                             <div class="file-col-name flex items-center overflow-hidden" style="width:calc(70% - 40px);">
-                                {% if not is_dir and file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.mp3', '.wav', '.ogg', '.flac', '.txt', '.py', '.js', '.html', '.css', '.json', '.md', '.ini', '.yml', '.sh', '.conf', '.sql', '.sp', '.trigger')) %}
+                                {% if not is_dir and file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.mp3', '.wav', '.ogg', '.flac', '.txt', '.py', '.js', '.html', '.css', '.json', '.md', '.ini', '.yml', '.sh', '.conf', '.sql', '.sp', '.trigger')) %}
                                 <a href="{{ url_for('list_files', req_path=file) }}" onclick="openLightbox('{{ url_for('list_files', req_path=file) }}', '{{ filename_only }}', event)" class="flex items-center w-full no-underline truncate" style="color:#c9d1d9;">
                                 {% else %}
                                 <a href="{{ url_for('list_files', req_path=file) }}" class="flex items-center w-full no-underline truncate" style="color:#c9d1d9;">
                                 {% endif %}
                                     <div class="w-6 sm:w-7 text-center text-sm sm:text-base mr-2 sm:mr-3 shrink-0
                                         {% if is_dir %} text-yellow-400
-                                        {% elif file.endswith(('.png', '.jpg', '.jpeg', '.gif')) %} text-cyan-400
-                                        {% elif file.endswith('.pdf') %} text-red-400
-                                        {% elif file.endswith(('.mp4', '.mov', '.avi')) %} text-green-400
-                                        {% elif file.endswith(('.zip', '.rar', '.7z')) %} text-orange-400
-                                        {% elif file.endswith(('.exe', '.dll')) %} text-purple-400
+                                        {% elif file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) %} text-cyan-400
+                                        {% elif file.lower().endswith('.pdf') %} text-red-400
+                                        {% elif file.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')) %} text-green-400
+                                        {% elif file.lower().endswith(('.zip', '.rar', '.7z')) %} text-orange-400
+                                        {% elif file.lower().endswith(('.exe', '.dll')) %} text-purple-400
                                         {% else %} text-blue-400
                                         {% endif %}">
                                         {% if is_dir %}<i class="bi bi-folder-fill"></i>
-                                        {% elif file.endswith(('.png', '.jpg', '.jpeg', '.gif')) %}<i class="bi bi-file-earmark-image-fill"></i>
-                                        {% elif file.endswith(('.zip', '.rar', '.7z')) %}<i class="bi bi-file-earmark-zip-fill"></i>
-                                        {% elif file.endswith('.pdf') %}<i class="bi bi-file-earmark-pdf-fill"></i>
-                                        {% elif file.endswith(('.mp4', '.mov', '.avi')) %}<i class="bi bi-file-earmark-play-fill"></i>
-                                        {% elif file.endswith(('.exe', '.dll')) %}<i class="bi bi-filetype-exe"></i>
+                                        {% elif file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) %}<i class="bi bi-file-earmark-image-fill"></i>
+                                        {% elif file.lower().endswith(('.zip', '.rar', '.7z')) %}<i class="bi bi-file-earmark-zip-fill"></i>
+                                        {% elif file.lower().endswith('.pdf') %}<i class="bi bi-file-earmark-pdf-fill"></i>
+                                        {% elif file.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')) %}<i class="bi bi-file-earmark-play-fill"></i>
+                                        {% elif file.lower().endswith(('.exe', '.dll')) %}<i class="bi bi-filetype-exe"></i>
                                         {% else %}<i class="bi bi-file-earmark-text-fill"></i>
                                         {% endif %}
                                     </div>
@@ -2039,23 +2071,122 @@ HTML_TEMPLATE = """
 <!-- Lightbox Modal -->
 <div id="lightboxOverlay" class="fixed inset-0 z-[100] hidden flex-col items-center justify-center bg-black/80 backdrop-blur-md opacity-0 transition-opacity duration-300">
     <div class="absolute top-4 right-4 flex gap-3 z-10">
-        <button onclick="closeLightbox()" class="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors border border-white/10">
-            <i class="bi bi-x-lg text-xl"></i>
+        <button onclick="closeLightbox()" class="w-10 h-10 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors border border-white/10" aria-label="Close Preview" title="Close (Esc)">
+            <i class="bi bi-x-lg text-lg"></i>
         </button>
     </div>
     <div class="absolute top-4 left-4 z-10 max-w-[calc(100vw-5rem)] sm:max-w-[75vw]">
-        <p id="lightboxTitle" class="text-white/90 font-medium text-xs sm:text-sm px-3 sm:px-4 py-2 bg-black/40 rounded-lg border border-white/10 backdrop-blur-md truncate" title=""></p>
+        <p id="lightboxTitle" class="text-white/90 font-medium text-xs sm:text-sm px-3 sm:px-4 py-2 bg-black/50 rounded-lg border border-white/10 backdrop-blur-md truncate" title=""></p>
     </div>
     <img id="lightboxImg" class="hidden max-w-[90%] max-h-[85vh] object-contain rounded-lg shadow-2xl transition-transform duration-300 scale-95 relative z-0" src="" alt="Preview">
-    <iframe id="lightboxPdf" class="hidden w-[90%] max-w-5xl h-[85vh] rounded-lg shadow-2xl transition-transform duration-300 scale-95 relative z-0 border-0 bg-white" src=""></iframe>
-    <video id="lightboxVideo" class="hidden max-w-[90%] max-h-[85vh] rounded-lg shadow-2xl transition-transform duration-300 scale-95 relative z-0" controls preload="metadata"></video>
-    <audio id="lightboxAudio" class="hidden w-[90%] max-w-2xl relative z-0" controls preload="metadata"></audio>
+    
+    <!-- PDF Viewer Container -->
+    <div id="lightboxPdfContainer" class="hidden w-[94%] max-w-5xl flex flex-col bg-[#161b22] border border-white/10 rounded-xl overflow-hidden shadow-2xl transition-transform duration-300 scale-95 relative z-0">
+        <div class="flex items-center justify-between px-3 sm:px-4 py-2.5 bg-[#0d1117] border-b border-white/10 gap-2 flex-wrap sm:flex-nowrap">
+            <div class="flex items-center gap-2 truncate pr-1 min-w-0">
+                <i class="bi bi-file-earmark-pdf-fill text-red-400 shrink-0"></i>
+                <span id="lightboxPdfTitle" class="text-xs sm:text-sm font-semibold text-slate-200 truncate"></span>
+            </div>
+            <!-- Toolbar for page navigation and zoom -->
+            <!-- Toolbar for page navigation and zoom (R-03: Accessible Tap Targets) -->
+            <div id="pdfToolbar" class="flex items-center gap-1.5 shrink-0 bg-white/5 px-2.5 py-1 rounded-lg border border-white/10 text-xs mx-auto sm:mx-0">
+                <button type="button" id="pdfPrevBtn" onclick="scrollPdfToPage(pdfCurrentPageNum - 1)" class="w-7 h-7 sm:w-8 sm:h-8 rounded-md flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors disabled:opacity-30 disabled:pointer-events-none focus:outline-none focus:ring-1 focus:ring-indigo-500" title="Previous Page (ArrowUp / ArrowLeft)">
+                    <i class="bi bi-chevron-up text-xs"></i>
+                </button>
+                <div class="flex items-center gap-1 px-1.5 text-slate-200 text-xs font-mono select-none">
+                    <input type="number" id="pdfPageInput" min="1" value="1" onchange="jumpPdfToPage(this.value)" class="w-9 sm:w-11 text-center bg-black/40 border border-white/10 rounded px-1 py-0.5 text-xs text-white focus:outline-none focus:border-indigo-500 font-mono" title="Current sheet number">
+                    <span class="text-slate-400">/</span>
+                    <span id="pdfTotalPages" class="text-slate-300">1</span>
+                </div>
+                <button type="button" id="pdfNextBtn" onclick="scrollPdfToPage(pdfCurrentPageNum + 1)" class="w-7 h-7 sm:w-8 sm:h-8 rounded-md flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors disabled:opacity-30 disabled:pointer-events-none focus:outline-none focus:ring-1 focus:ring-indigo-500" title="Next Page (ArrowDown / ArrowRight)">
+                    <i class="bi bi-chevron-down text-xs"></i>
+                </button>
+                <div class="w-px h-4 bg-white/10 mx-1"></div>
+                <button type="button" onclick="zoomPdf(-0.2)" class="w-7 h-7 sm:w-8 sm:h-8 rounded-md flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-500" title="Zoom Out">
+                    <i class="bi bi-dash text-sm"></i>
+                </button>
+                <span id="pdfZoomLabel" class="text-[11px] font-mono font-medium text-slate-300 px-1 select-none min-w-[38px] text-center">100%</span>
+                <button type="button" onclick="zoomPdf(0.2)" class="w-7 h-7 sm:w-8 sm:h-8 rounded-md flex items-center justify-center text-slate-300 hover:text-white hover:bg-white/10 transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-500" title="Zoom In">
+                    <i class="bi bi-plus text-sm"></i>
+                </button>
+                <button type="button" onclick="resetPdfZoom()" class="px-2 py-1 rounded text-[11px] font-mono font-medium text-slate-300 hover:text-white hover:bg-white/10 border border-white/5 transition-colors focus:outline-none focus:ring-1 focus:ring-indigo-500" title="Fit to Width">
+                    Fit
+                </button>
+            </div>
+            <div class="flex items-center gap-2 shrink-0">
+                <span id="lightboxPdfFormat" class="px-2 py-0.5 text-[10px] font-mono font-medium rounded bg-red-500/20 text-red-300 border border-red-500/30">PDF</span>
+                <a id="lightboxPdfNewTab" href="#" target="_blank" rel="noopener noreferrer" class="px-2.5 py-1 text-xs font-medium rounded-lg bg-white/10 hover:bg-white/20 text-slate-200 hover:text-white transition-colors flex items-center gap-1.5 border border-white/10" title="Open PDF in new tab">
+                    <i class="bi bi-box-arrow-up-right text-[11px]"></i>
+                    <span class="hidden sm:inline">Open in Tab</span>
+                </a>
+            </div>
+        </div>
+        <div id="pdfViewerArea" class="relative bg-[#0b0f17] flex-1 w-full h-[70vh] sm:h-[78vh] overflow-y-auto overflow-x-auto flex flex-col items-center p-3 sm:p-6 select-none scroll-smooth">
+            <div id="pdfLoadingIndicator" class="flex flex-col items-center justify-center m-auto text-slate-300 py-16">
+                <i class="bi bi-arrow-repeat animate-spin text-3xl text-indigo-400 mb-2"></i>
+                <span class="text-xs font-medium text-slate-300">Rendering PDF document...</span>
+            </div>
+            <!-- Multi-Sheet Container: Real Paper Sheet Aesthetics -->
+            <div id="pdfPagesContainer" class="flex flex-col items-center w-full max-w-full space-y-6"></div>
+            <div id="pdfFallbackNotice" class="hidden flex flex-col items-center justify-center m-auto text-center p-6 max-w-md">
+                <i class="bi bi-file-earmark-pdf text-red-400 text-4xl mb-3"></i>
+                <p class="text-sm font-semibold text-slate-100 mb-1">Cannot render PDF preview</p>
+                <p class="text-xs text-slate-400 mb-4">Your browser was unable to render this document. You can open it in a new tab or download the file.</p>
+                <div class="flex items-center gap-3">
+                    <a id="pdfFallbackNewTabBtn" href="#" target="_blank" rel="noopener noreferrer" class="px-4 py-2 text-xs font-medium rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition-colors flex items-center gap-2"><i class="bi bi-box-arrow-up-right"></i> Open in New Tab</a>
+                    <a id="pdfFallbackDownloadBtn" href="#" class="px-4 py-2 text-xs font-medium rounded-lg bg-white/10 hover:bg-white/20 text-slate-200 border border-white/10 transition-colors flex items-center gap-2"><i class="bi bi-download"></i> Download</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Video Player Container (Anti-Slop Craftsmanship) -->
+    <div id="lightboxVideoContainer" class="hidden w-[94%] max-w-4xl flex flex-col bg-[#161b22] border border-white/10 rounded-xl overflow-hidden shadow-2xl transition-transform duration-300 scale-95 relative z-0">
+        <div class="flex items-center justify-between px-4 py-2.5 bg-[#0d1117] border-b border-white/10">
+            <div class="flex items-center gap-2 truncate pr-2">
+                <i class="bi bi-play-circle-fill text-blue-400"></i>
+                <span id="lightboxVideoTitle" class="text-xs sm:text-sm font-semibold text-slate-200 truncate"></span>
+            </div>
+            <span id="lightboxVideoFormat" class="px-2 py-0.5 text-[10px] font-mono font-medium rounded bg-white/10 text-slate-300 shrink-0">MP4</span>
+        </div>
+        <div class="relative bg-black flex items-center justify-center min-h-[200px] max-h-[75vh]">
+            <video id="lightboxVideo" class="w-full max-h-[75vh] object-contain" controls preload="metadata" playsinline></video>
+            <div id="videoErrorMessage" class="hidden p-6 text-center text-slate-300 text-xs sm:text-sm">
+                <i class="bi bi-exclamation-triangle text-amber-400 text-2xl mb-2 block"></i>
+                Browser cannot play this video codec directly. You can download the file to play it locally.
+            </div>
+        </div>
+    </div>
+
+    <!-- Audio Player Container (Anti-Slop Craftsmanship) -->
+    <div id="lightboxAudioContainer" class="hidden w-[92%] max-w-md bg-[#161b22] border border-white/10 rounded-xl p-5 sm:p-6 shadow-2xl transition-transform duration-300 scale-95 relative z-0">
+        <div class="flex items-center gap-3.5 mb-4">
+            <div class="w-12 h-12 rounded-lg bg-blue-600/20 border border-blue-500/30 text-blue-400 flex items-center justify-center shrink-0">
+                <i class="bi bi-music-note-beamed text-2xl"></i>
+            </div>
+            <div class="overflow-hidden min-w-0 flex-1">
+                <div class="flex items-center gap-2 mb-0.5">
+                    <span id="lightboxAudioFormat" class="px-1.5 py-0.5 text-[9px] font-mono font-semibold uppercase rounded bg-white/10 text-slate-300">AUDIO</span>
+                </div>
+                <h3 id="lightboxAudioTitle" class="text-sm font-semibold text-slate-100 truncate"></h3>
+                <p class="text-xs text-slate-400 mt-0.5">Audio Player</p>
+            </div>
+        </div>
+        <div class="bg-[#0d1117] rounded-lg p-2 border border-white/5">
+            <audio id="lightboxAudio" class="w-full" controls preload="metadata"></audio>
+        </div>
+        <div id="audioErrorMessage" class="hidden text-center text-slate-300 text-xs mt-3">
+            <i class="bi bi-exclamation-circle text-amber-400 mr-1"></i>
+            Audio stream error or format not supported by browser.
+        </div>
+    </div>
+
     <div id="lightboxEditor" class="hidden w-[90%] max-w-5xl h-[85vh] rounded-lg shadow-2xl relative z-0 border border-white/10 overflow-hidden bg-[#1e1e1e] text-left"></div>
-    <div class="mt-6 z-10 flex gap-3">
-        <button id="lightboxSaveBtn" class="hidden px-6 py-2.5 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold transition-colors shadow-lg shadow-indigo-900/50 flex items-center gap-2" onclick="saveEditorContent()">
+    <div class="mt-5 z-10 flex gap-3">
+        <button id="lightboxSaveBtn" class="hidden px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs sm:text-sm font-medium transition-colors flex items-center gap-2" onclick="saveEditorContent()">
             <i class="bi bi-save2"></i> <span class="hidden sm:inline">Save Changes</span><span class="sm:hidden">Save</span>
         </button>
-        <a id="lightboxDownloadBtn" href="#" class="px-6 py-2.5 rounded-full bg-white/10 hover:bg-white/20 text-white text-sm font-semibold transition-colors border border-white/10 backdrop-blur-md flex items-center gap-2">
+        <a id="lightboxDownloadBtn" href="#" class="px-5 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs sm:text-sm font-medium transition-colors border border-white/10 backdrop-blur-md flex items-center gap-2" title="Download file">
             <i class="bi bi-download"></i> <span id="lightboxDownloadText">Download</span>
         </a>
     </div>
@@ -2131,14 +2262,210 @@ HTML_TEMPLATE = """
     let currentEditingFileUrl = "";
     let currentEditingFilePath = "";
 
-    // --- LIGHTBOX LOGIC ---
+    // PDF.js State & Multi-Sheet Helpers (Anti-Slop Craftsmanship)
+    if (window.pdfjsLib) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+    let pdfDocInstance = null;
+    let pdfCurrentPageNum = 1;
+    let pdfCurrentZoom = 1.0;
+    let pdfObserver = null;
+    let pdfRenderGeneration = 0;
+
+    async function renderPdfDocument() {
+        if (!pdfDocInstance) return;
+        const currentGen = ++pdfRenderGeneration;
+        const container = document.getElementById('pdfPagesContainer');
+        const loading = document.getElementById('pdfLoadingIndicator');
+        const fallback = document.getElementById('pdfFallbackNotice');
+        
+        if (!container) return;
+        container.innerHTML = '';
+        if (loading) loading.classList.remove('hidden');
+        if (fallback) fallback.classList.add('hidden');
+        
+        const totalPages = pdfDocInstance.numPages;
+        const totalEl = document.getElementById('pdfTotalPages');
+        if (totalEl) totalEl.textContent = totalPages;
+        
+        const pageInput = document.getElementById('pdfPageInput');
+        if (pageInput) {
+            pageInput.max = totalPages;
+            pageInput.value = pdfCurrentPageNum;
+        }
+
+        const zoomLabel = document.getElementById('pdfZoomLabel');
+        if (zoomLabel) {
+            zoomLabel.textContent = Math.round(pdfCurrentZoom * 100) + '%';
+        }
+
+        const viewerArea = document.getElementById('pdfViewerArea');
+        const availableWidth = viewerArea ? Math.max(300, viewerArea.clientWidth - 56) : 800;
+        
+        if (pdfObserver) {
+            pdfObserver.disconnect();
+            pdfObserver = null;
+        }
+
+        try {
+            // Pre-create sheet shells for natural continuous scroll height
+            for (let num = 1; num <= totalPages; num++) {
+                const sheetWrapper = document.createElement('div');
+                sheetWrapper.id = `pdfSheet_${num}`;
+                sheetWrapper.dataset.pageNum = num;
+                sheetWrapper.className = 'pdf-sheet-wrapper relative flex flex-col items-center transition-all duration-150';
+                
+                // Floating Sheet Badge
+                const pill = document.createElement('div');
+                pill.className = 'pdf-sheet-pill mb-2 self-start px-2.5 py-0.5 rounded text-[11px] font-mono font-medium bg-[#161b22]/90 text-slate-300 border border-white/10 shadow-sm flex items-center gap-1.5 select-none';
+                pill.innerHTML = `<i class="bi bi-file-earmark-text text-red-400"></i> Sheet ${num} of ${totalPages}`;
+                
+                // Real Paper Card Appearance
+                const card = document.createElement('div');
+                card.className = 'pdf-sheet-card bg-white rounded-sm shadow-2xl overflow-hidden border border-black/15';
+                card.style.boxShadow = '0 8px 30px rgba(0,0,0,0.5), 0 1px 3px rgba(0,0,0,0.3)';
+                
+                const canvas = document.createElement('canvas');
+                canvas.className = 'pdf-sheet-canvas block';
+                canvas.id = `pdfCanvas_${num}`;
+                
+                card.appendChild(canvas);
+                sheetWrapper.appendChild(pill);
+                sheetWrapper.appendChild(card);
+                container.appendChild(sheetWrapper);
+            }
+
+            // Sequentially render canvases
+            for (let num = 1; num <= totalPages; num++) {
+                if (currentGen !== pdfRenderGeneration) return;
+                
+                const page = await pdfDocInstance.getPage(num);
+                const unscaled = page.getViewport({ scale: 1.0 });
+                
+                let baseScale = availableWidth / unscaled.width;
+                if (baseScale > 1.35) baseScale = 1.35;
+                if (baseScale < 0.35) baseScale = 0.35;
+                let scale = baseScale * pdfCurrentZoom;
+                
+                const dpr = window.devicePixelRatio || 1;
+                const viewport = page.getViewport({ scale: scale });
+                
+                const canvas = document.getElementById(`pdfCanvas_${num}`);
+                if (!canvas) continue;
+                
+                canvas.width = Math.floor(viewport.width * dpr);
+                canvas.height = Math.floor(viewport.height * dpr);
+                canvas.style.width = Math.floor(viewport.width) + 'px';
+                canvas.style.height = Math.floor(viewport.height) + 'px';
+                
+                const ctx = canvas.getContext('2d');
+                ctx.scale(dpr, dpr);
+                
+                await page.render({
+                    canvasContext: ctx,
+                    viewport: viewport
+                }).promise;
+            }
+
+            if (loading) loading.classList.add('hidden');
+            setupPdfScrollSpy();
+            updatePdfNavButtons();
+
+        } catch (err) {
+            console.error('PDF multi-sheet render error', err);
+            if (loading) loading.classList.add('hidden');
+            if (fallback) fallback.classList.remove('hidden');
+        }
+    }
+
+    function setupPdfScrollSpy() {
+        const viewerArea = document.getElementById('pdfViewerArea');
+        if (!viewerArea) return;
+        
+        pdfObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && entry.intersectionRatio >= 0.35) {
+                    const num = parseInt(entry.target.dataset.pageNum, 10);
+                    if (num && num !== pdfCurrentPageNum) {
+                        pdfCurrentPageNum = num;
+                        const pageInput = document.getElementById('pdfPageInput');
+                        if (pageInput) pageInput.value = num;
+                        updatePdfNavButtons();
+                    }
+                }
+            });
+        }, {
+            root: viewerArea,
+            threshold: [0.35, 0.7]
+        });
+
+        document.querySelectorAll('.pdf-sheet-wrapper').forEach(sheet => {
+            pdfObserver.observe(sheet);
+        });
+    }
+
+    function scrollPdfToPage(num) {
+        if (!pdfDocInstance) return;
+        if (num < 1) num = 1;
+        if (num > pdfDocInstance.numPages) num = pdfDocInstance.numPages;
+        pdfCurrentPageNum = num;
+        
+        const targetSheet = document.getElementById(`pdfSheet_${num}`);
+        if (targetSheet) {
+            targetSheet.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        const pageInput = document.getElementById('pdfPageInput');
+        if (pageInput) pageInput.value = num;
+        updatePdfNavButtons();
+    }
+
+    function jumpPdfToPage(val) {
+        let num = parseInt(val, 10);
+        if (isNaN(num)) num = 1;
+        scrollPdfToPage(num);
+    }
+
+    function updatePdfNavButtons() {
+        if (!pdfDocInstance) return;
+        const prev = document.getElementById('pdfPrevBtn');
+        const next = document.getElementById('pdfNextBtn');
+        if (prev) prev.disabled = (pdfCurrentPageNum <= 1);
+        if (next) next.disabled = (pdfCurrentPageNum >= pdfDocInstance.numPages);
+    }
+
+    function zoomPdf(delta) {
+        pdfCurrentZoom += delta;
+        if (pdfCurrentZoom < 0.4) pdfCurrentZoom = 0.4;
+        if (pdfCurrentZoom > 2.5) pdfCurrentZoom = 2.5;
+        renderPdfDocument();
+    }
+
+    function resetPdfZoom() {
+        pdfCurrentZoom = 1.0;
+        renderPdfDocument();
+    }
+
+    // Lightbox modal logic
     function openLightbox(url, filename, event) {
         if(event) { event.preventDefault(); event.stopPropagation(); }
         const overlay = document.getElementById('lightboxOverlay');
         const img = document.getElementById('lightboxImg');
-        const pdf = document.getElementById('lightboxPdf');
+        const pdfContainer = document.getElementById('lightboxPdfContainer');
+        const pdfTitle = document.getElementById('lightboxPdfTitle');
+        const pdfNewTab = document.getElementById('lightboxPdfNewTab');
+        const pdfFallbackNotice = document.getElementById('pdfFallbackNotice');
+        const pdfFallbackNewTabBtn = document.getElementById('pdfFallbackNewTabBtn');
+        const pdfFallbackDownloadBtn = document.getElementById('pdfFallbackDownloadBtn');
         const video = document.getElementById('lightboxVideo');
+        const videoContainer = document.getElementById('lightboxVideoContainer');
+        const videoTitle = document.getElementById('lightboxVideoTitle');
+        const videoFormat = document.getElementById('lightboxVideoFormat');
+        const videoErr = document.getElementById('videoErrorMessage');
         const audio = document.getElementById('lightboxAudio');
+        const audioContainer = document.getElementById('lightboxAudioContainer');
+        const audioTitle = document.getElementById('lightboxAudioTitle');
+        const audioFormat = document.getElementById('lightboxAudioFormat');
+        const audioErr = document.getElementById('audioErrorMessage');
         const editor = document.getElementById('lightboxEditor');
         const title = document.getElementById('lightboxTitle');
         const downloadBtn = document.getElementById('lightboxDownloadBtn');
@@ -2153,9 +2480,14 @@ HTML_TEMPLATE = """
         
         // Hide all first
         img.classList.add('hidden'); img.src = '';
-        pdf.classList.add('hidden'); pdf.src = '';
-        video.classList.add('hidden'); video.src = '';
-        audio.classList.add('hidden'); audio.src = '';
+        if(pdfContainer) pdfContainer.classList.add('hidden');
+        if(pdfFallbackNotice) pdfFallbackNotice.classList.add('hidden');
+        if(videoContainer) videoContainer.classList.add('hidden');
+        if(audioContainer) audioContainer.classList.add('hidden');
+        if(videoErr) videoErr.classList.add('hidden');
+        if(audioErr) audioErr.classList.add('hidden');
+        if(video) { video.pause(); video.src = ''; }
+        if(audio) { audio.pause(); audio.src = ''; }
         if(editor) editor.classList.add('hidden');
         if(saveBtn) saveBtn.classList.add('hidden');
         
@@ -2203,36 +2535,73 @@ HTML_TEMPLATE = """
                     });
             }
         } else if (ext.endsWith('.pdf')) {
-            targetEl = pdf;
+            targetEl = pdfContainer;
+            if(pdfTitle) pdfTitle.textContent = filename;
+            if(pdfNewTab) pdfNewTab.href = previewUrl;
+            if(pdfFallbackNewTabBtn) pdfFallbackNewTabBtn.href = previewUrl;
+            if(pdfFallbackDownloadBtn) pdfFallbackDownloadBtn.href = url;
+            
+            const loading = document.getElementById('pdfLoadingIndicator');
+            const fallback = document.getElementById('pdfFallbackNotice');
+            const container = document.getElementById('pdfPagesContainer');
+            if(container) container.innerHTML = '';
+            if(loading) loading.classList.remove('hidden');
+            if(fallback) fallback.classList.add('hidden');
+            
+            pdfDocInstance = null;
+            pdfCurrentPageNum = 1;
+            pdfCurrentZoom = 1.0;
+            
+            if (window.pdfjsLib) {
+                pdfjsLib.getDocument(previewUrl).promise.then(function(doc) {
+                    pdfDocInstance = doc;
+                    renderPdfDocument();
+                }).catch(function(err) {
+                    console.error('Failed to load PDF via PDF.js', err);
+                    if(loading) loading.classList.add('hidden');
+                    if(fallback) fallback.classList.remove('hidden');
+                });
+            } else {
+                if(loading) loading.classList.add('hidden');
+                if(fallback) fallback.classList.remove('hidden');
+            }
             if(downloadText) downloadText.textContent = "Download PDF";
         } else if (ext.endsWith('.mp4') || ext.endsWith('.mov') || ext.endsWith('.avi') || ext.endsWith('.mkv') || ext.endsWith('.webm')) {
-            targetEl = video;
+            targetEl = videoContainer;
+            if(videoTitle) videoTitle.textContent = filename;
+            if(videoFormat) videoFormat.textContent = ext.split('.').pop().toUpperCase();
+            if(video) {
+                video.onerror = () => { if(videoErr) videoErr.classList.remove('hidden'); };
+                video.src = previewUrl;
+                video.play().catch(e => console.log('Auto-play prevented', e));
+            }
             if(downloadText) downloadText.textContent = "Download Video";
-        } else if (ext.endsWith('.mp3') || ext.endsWith('.wav') || ext.endsWith('.ogg') || ext.endsWith('.flac')) {
-            targetEl = audio;
+        } else if (ext.endsWith('.mp3') || ext.endsWith('.wav') || ext.endsWith('.ogg') || ext.endsWith('.flac') || ext.endsWith('.m4a') || ext.endsWith('.aac')) {
+            targetEl = audioContainer;
+            if(audioTitle) audioTitle.textContent = filename;
+            if(audioFormat) audioFormat.textContent = ext.split('.').pop().toUpperCase();
+            if(audio) {
+                audio.onerror = () => { if(audioErr) audioErr.classList.remove('hidden'); };
+                audio.src = previewUrl;
+                audio.play().catch(e => console.log('Auto-play prevented', e));
+            }
             if(downloadText) downloadText.textContent = "Download Audio";
         } else {
             targetEl = img;
+            targetEl.src = previewUrl;
             if(downloadText) downloadText.textContent = "Download Image";
         }
         
-        if (!isText && targetEl) {
-            targetEl.src = previewUrl;
-        }
-        
         if(targetEl) targetEl.classList.remove('hidden');
-        if(targetEl === video || targetEl === audio) {
-            targetEl.play().catch(e => console.log('Auto-play prevented', e));
-        }
         
         overlay.classList.remove('hidden');
         overlay.classList.add('flex');
         
         setTimeout(() => {
             overlay.classList.remove('opacity-0');
-            if(targetEl !== audio && targetEl !== editor) {
-                if(targetEl) targetEl.classList.remove('scale-95');
-                if(targetEl) targetEl.classList.add('scale-100');
+            if(targetEl) {
+                targetEl.classList.remove('scale-95');
+                targetEl.classList.add('scale-100');
             }
         }, 10);
     }
@@ -2248,19 +2617,15 @@ HTML_TEMPLATE = """
         fetch('/api/save_text', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                req_path: currentEditingFilePath,
-                content: content
-            })
+            body: JSON.stringify({ file_path: currentEditingFilePath, content: content })
         })
-        .then(res => res.json())
+        .then(r => r.json())
         .then(data => {
             if(data.success) {
                 const toastContainer = document.getElementById('toastContainer');
                 if (toastContainer) {
                     const toast = document.createElement('div');
-                    toast.className = `toast-message pointer-events-auto p-3.5 sm:p-4 rounded-2xl text-sm flex items-center justify-between bg-slate-800/85 backdrop-blur-xl shadow-2xl border transition-all duration-500 border-emerald-500/30`;
-                    toast.style.cssText = "box-shadow: 0 10px 40px -10px rgba(0,0,0,0.5); animation: toastSlideDown 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;";
+                    toast.className = `toast-message pointer-events-auto p-3.5 sm:p-4 rounded-xl text-sm flex items-center justify-between bg-slate-800/90 shadow-2xl border transition-all duration-300 border-emerald-500/30`;
                     toast.innerHTML = `
                         <div class="flex items-center gap-3">
                             <div class="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-emerald-500/20 text-emerald-400">
@@ -2278,7 +2643,7 @@ HTML_TEMPLATE = """
                     alert("File saved successfully!");
                 }
             } else {
-                alert("Failed to save: " + data.message);
+                alert("Failed to save: " + (data.message || data.error || "Unknown error"));
             }
         })
         .catch(err => {
@@ -2293,29 +2658,54 @@ HTML_TEMPLATE = """
     function closeLightbox() {
         const overlay = document.getElementById('lightboxOverlay');
         const img = document.getElementById('lightboxImg');
-        const pdf = document.getElementById('lightboxPdf');
+        const pdfContainer = document.getElementById('lightboxPdfContainer');
         const video = document.getElementById('lightboxVideo');
+        const videoContainer = document.getElementById('lightboxVideoContainer');
         const audio = document.getElementById('lightboxAudio');
+        const audioContainer = document.getElementById('lightboxAudioContainer');
         const editor = document.getElementById('lightboxEditor');
+        
+        pdfDocInstance = null;
+        pdfRenderGeneration++;
+        if (pdfObserver) {
+            pdfObserver.disconnect();
+            pdfObserver = null;
+        }
+        const pagesContainer = document.getElementById('pdfPagesContainer');
+        if(pagesContainer) pagesContainer.innerHTML = '';
         
         overlay.classList.add('opacity-0');
         if(img) { img.classList.remove('scale-100'); img.classList.add('scale-95'); }
-        if(pdf) { pdf.classList.remove('scale-100'); pdf.classList.add('scale-95'); }
-        if(video) { video.classList.remove('scale-100'); video.classList.add('scale-95'); }
+        if(pdfContainer) { pdfContainer.classList.remove('scale-100'); pdfContainer.classList.add('scale-95'); }
+        if(videoContainer) { videoContainer.classList.remove('scale-100'); videoContainer.classList.add('scale-95'); }
+        if(audioContainer) { audioContainer.classList.remove('scale-100'); audioContainer.classList.add('scale-95'); }
         
-        if(video) video.pause();
-        if(audio) audio.pause();
+        if(video) { video.pause(); }
+        if(audio) { audio.pause(); }
         
         setTimeout(() => {
             overlay.classList.add('hidden');
             overlay.classList.remove('flex');
             if(window.monacoEditorInstance) window.monacoEditorInstance.setValue("");
             if(img) img.src = '';
-            if(pdf) pdf.src = '';
-            if(video) video.src = '';
-            if(audio) audio.src = '';
+            if(video) { video.src = ''; video.load(); }
+            if(audio) { audio.src = ''; audio.load(); }
         }, 300);
     }
+
+    // Keyboard Accessibility (R-32): Close lightbox with Escape, PDF page navigation with arrows
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            const overlay = document.getElementById('lightboxOverlay');
+            if (overlay && !overlay.classList.contains('hidden')) {
+                closeLightbox();
+            }
+        } else if ((e.key === 'ArrowUp' || e.key === 'ArrowLeft') && pdfDocInstance) {
+            scrollPdfToPage(pdfCurrentPageNum - 1);
+        } else if ((e.key === 'ArrowDown' || e.key === 'ArrowRight') && pdfDocInstance) {
+            scrollPdfToPage(pdfCurrentPageNum + 1);
+        }
+    });
 
     // --- SORTABLE COLUMNS ---
     let sortOrders = { name: 1, size: 1, date: 1 };
@@ -2723,7 +3113,7 @@ HTML_TEMPLATE = """
             });
         }
 
-        // --- NEW: UPLOAD PROGRESS BAR HANDLER (CHUNKED) ---
+        // Chunked upload progress handler
         const uploadForm = document.getElementById('uploadForm');
         const fileInput = document.getElementById('fileInput');
         const dropZone = document.getElementById('dropZone');
@@ -2779,7 +3169,7 @@ HTML_TEMPLATE = """
                 const pin = pinInput.value;
                 const targetPath = uploadForm.querySelector('[name="target_path"]').value;
 
-                const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+                const CHUNK_SIZE = 10 * 1024 * 1024;
                 const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
                 const uploadId = Date.now().toString() + '_' + Math.random().toString(36).substr(2, 9);
                 let currentChunk = 0;
@@ -3510,7 +3900,7 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
-# HTML untuk Modals (Menggantikan {% include 'modals.html' %})
+
 MODALS_HTML = """
 <style>
 /* Glass Modals */
@@ -3534,42 +3924,45 @@ MODALS_HTML = """
 }
 .modal-input {
     background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.12);
     color: #e2e8f0;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 10px 14px;
     width: 100%;
     font-size: 13px;
     transition: all 0.2s;
 }
 .modal-input:focus {
-    border-color: rgba(88,101,242,0.6);
-    box-shadow: 0 0 0 3px rgba(88,101,242,0.15);
-    background: rgba(255,255,255,0.07);
-    outline: none;
+    border-color: #5865f2;
+    box-shadow: 0 0 0 2px rgba(88,101,242,0.25);
+    background: rgba(255,255,255,0.08);
 }
-.modal-input::placeholder { color: #4d5566; }
+.modal-input:focus-visible {
+    outline: 2px solid #5865f2;
+    outline-offset: 1px;
+}
+.modal-input::placeholder { color: #8b949e; }
 .modal-label {
     display: block;
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: #7d8590;
+    color: #94a3b8;
     margin-bottom: 6px;
 }
 .modal-input-group {
     display: flex;
     align-items: center;
     background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
     overflow: hidden;
     transition: all 0.2s;
 }
 .modal-input-group:focus-within {
-    border-color: rgba(88,101,242,0.6);
-    box-shadow: 0 0 0 3px rgba(88,101,242,0.15);
+    border-color: #5865f2;
+    box-shadow: 0 0 0 2px rgba(88,101,242,0.25);
 }
 .modal-input-group .group-icon {
     padding: 10px 12px;
@@ -3584,9 +3977,11 @@ MODALS_HTML = """
     padding: 10px 14px;
     font-size: 13px;
     flex: 1;
+}
+.modal-input-group input:focus-visible, .modal-input-group textarea:focus-visible {
     outline: none;
 }
-.modal-input-group input::placeholder { color: #4d5566; }
+.modal-input-group input::placeholder { color: #8b949e; }
 .modal-btn-cancel {
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.1);
@@ -3693,7 +4088,7 @@ MODALS_HTML = """
                   <div class="flex flex-col items-center justify-center space-y-2 pointer-events-none">
                       <i class="bi bi-cloud-arrow-up text-4xl" style="color:#5865f2;"></i>
                       <p class="text-sm font-medium text-slate-300" id="fileSelectedName">Drag and drop file here, or click to browse</p>
-                      <p class="text-xs" style="color:#4d5566;">Supports all standard files</p>
+                      <p class="text-xs" style="color:#8b949e;">Supports all standard files</p>
                   </div>
               </div>
           </div>
@@ -3946,7 +4341,7 @@ MODALS_HTML = """
       <button type="button" class="text-slate-400 hover:text-white transition-colors" onclick="closeModal('shareLinkModal')"><i class="bi bi-x-lg text-sm"></i></button>
     </div>
     <div class="modal-body overflow-y-auto space-y-4">
-      <p class="text-xs" style="color:#7d8590;">Anyone with this link can view and download the file—no login required.</p>
+      <p class="text-xs" style="color:#94a3b8;">Anyone with this link can view and download the file (no login required).</p>
       <div>
           <label class="modal-label" for="linkExpiryDate">Valid Until (Optional)</label>
           <div class="modal-input-group">
@@ -3954,7 +4349,7 @@ MODALS_HTML = """
               <input type="date" id="linkExpiryDate" style="color-scheme:dark;" title="Leave empty for unlimited access">
               <button onclick="document.getElementById('linkExpiryDate').value = ''; generateSharedLinkFromModal();" class="px-3 text-xs font-bold hover:opacity-80 transition-opacity border-l" style="color:#14b8a6;border-color:rgba(255,255,255,0.08);" title="Clear to make Unlimited">Unlimited</button>
           </div>
-          <p class="text-xs mt-1 italic" style="color:#4d5566;">* Default is unlimited if not set.</p>
+          <p class="text-xs mt-1 italic" style="color:#8b949e;">* Default is unlimited if not set.</p>
       </div>
       <div class="modal-input-group">
           <input type="text" id="shareLinkInput" class="font-mono text-xs" style="color:#c9d1d9;" readonly>
@@ -3963,7 +4358,7 @@ MODALS_HTML = """
           </button>
       </div>
       <div class="flex flex-col items-center justify-center">
-          <p class="text-xs font-semibold mb-2" style="color:#7d8590;">Scan QR Code</p>
+          <p class="text-xs font-semibold mb-2" style="color:#94a3b8;">Scan QR Code</p>
           <img id="shareQRCode" src="" class="rounded-xl p-2" style="width:150px;height:150px;display:none;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);" alt="QR Code">
       </div>
     </div>
@@ -3981,7 +4376,7 @@ MODALS_HTML = """
       <button type="button" class="text-slate-400 hover:text-white transition-colors" onclick="closeModal('shareUploadLinkModal')"><i class="bi bi-x-lg text-sm"></i></button>
     </div>
     <div class="modal-body overflow-y-auto space-y-4">
-      <p class="text-xs" style="color:#7d8590;">Anyone with this link can upload files directly to this folder—no login or PIN required.</p>
+      <p class="text-xs" style="color:#94a3b8;">Anyone with this link can upload files directly to this folder (no login or PIN required).</p>
       <div>
           <label class="modal-label" for="uploadLinkExpiryDate">Valid Until (Optional)</label>
           <div class="modal-input-group">
@@ -3989,7 +4384,7 @@ MODALS_HTML = """
               <input type="date" id="uploadLinkExpiryDate" style="color-scheme:dark;" title="Leave empty for unlimited access">
               <button onclick="document.getElementById('uploadLinkExpiryDate').value = ''; generateSharedUploadLinkFromModal();" class="px-3 text-xs font-bold hover:opacity-80 transition-opacity border-l" style="color:#10b981;border-color:rgba(255,255,255,0.08);" title="Clear to make Unlimited">Unlimited</button>
           </div>
-          <p class="text-xs mt-1 italic" style="color:#4d5566;">* Default is unlimited if not set.</p>
+          <p class="text-xs mt-1 italic" style="color:#8b949e;">* Default is unlimited if not set.</p>
       </div>
       <div class="modal-input-group">
           <input type="text" id="shareUploadLinkInput" class="font-mono text-xs" style="color:#c9d1d9;" readonly>
@@ -3998,7 +4393,7 @@ MODALS_HTML = """
           </button>
       </div>
       <div class="flex flex-col items-center justify-center">
-          <p class="text-xs font-semibold mb-2" style="color:#7d8590;">Scan QR Code</p>
+          <p class="text-xs font-semibold mb-2" style="color:#94a3b8;">Scan QR Code</p>
           <img id="shareUploadQRCode" src="" class="rounded-xl p-2" style="width:150px;height:150px;display:none;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);" alt="QR Code">
       </div>
     </div>
@@ -4146,21 +4541,25 @@ DOWNLOAD_TEMPLATE = """
             gap: 10px;
             width: 100%;
             padding: 14px 20px;
-            background: linear-gradient(135deg, #5865f2, #7c85f5);
+            background: #5865f2;
             color: white;
-            font-weight: 700;
+            font-weight: 600;
             font-size: 15px;
-            border-radius: 14px;
+            border-radius: 10px;
             text-decoration: none;
-            transition: all 0.2s;
-            box-shadow: 0 6px 20px rgba(88,101,242,0.4);
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.25);
         }
         .btn-download:hover {
-            background: linear-gradient(135deg, #6674ff, #8b94f8);
-            box-shadow: 0 10px 28px rgba(88,101,242,0.5);
+            background: #4752c4;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
             transform: translateY(-1px);
         }
-        .footer { text-align: center; font-size: 10px; color: #4d5566; margin-top: 20px; letter-spacing: 0.15em; text-transform: uppercase; font-weight: 600; }
+        .btn-download:focus-visible {
+            outline: 2px solid #ffffff;
+            outline-offset: 2px;
+        }
+        .footer { text-align: center; font-size: 10px; color: #8b949e; margin-top: 20px; letter-spacing: 0.15em; text-transform: uppercase; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -4681,7 +5080,7 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
-# --- Endpoint untuk mengelola status Edit Mode di Session ---
+# Edit mode session management
 @app.route("/toggle_edit_mode", methods=["POST"])
 @login_required
 def toggle_edit_mode():
@@ -4708,7 +5107,7 @@ def toggle_edit_mode():
 def check_edit_mode_status():
     return jsonify({"active": session.get("edit_mode_active", False)})
 
-# --- Endpoint BARU untuk Network Config (Diperbaiki untuk Gateway) ---
+# Network configuration
 @app.route("/network_config", methods=["GET"])
 @login_required
 def get_network_config():
@@ -4780,7 +5179,7 @@ def get_network_config():
         logging.error(f"Failed to get network config: {e}")
         return jsonify({"success": False, "error": f"Failed to get network configuration: {e}"}), 500
 
-# --- Endpoint BARU untuk Event Log 1074 (Diperbarui untuk 30 hari dan tampilan) ---
+# Windows Event Log 1074
 if platform.system() == "Windows":
     def clean_time_string(time_raw):
         try:
@@ -5074,7 +5473,7 @@ def get_system_stats():
 @login_required
 def list_files(req_path):
     abs_path = os.path.abspath(os.path.join(directory, req_path))
-    if not abs_path.startswith(directory):
+    if not is_safe_path(directory, abs_path):
         logging.warning(f"Unauthorized access attempt: {abs_path}")
         abort(403)
     if os.path.isfile(abs_path):
@@ -5114,8 +5513,6 @@ def list_files(req_path):
         current_year=datetime.now().year 
     )
 
-# --- Sisa endpoint lainnya (upload, delete, rename, new_folder, move, compress, extract) ---
-# (Tidak diubah, tetap seperti di file asli Anda)
 
 @app.route("/upload", methods=["POST"])
 @login_required
@@ -5129,10 +5526,14 @@ def upload_file():
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
     file = request.files["file"]
-    if file.filename == "":
+    if not file or file.filename == "":
         flash("No file selected.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
-    ext = os.path.splitext(file.filename)[1].lower()
+    filename = get_secure_filename(file.filename)
+    if not filename:
+        flash("Invalid filename.", "danger")
+        return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
+    ext = os.path.splitext(filename)[1].lower()
     if not is_allowed_extension(ext):
         flash("File type is not allowed.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
@@ -5145,28 +5546,33 @@ def upload_file():
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
     target_rel_path = request.form["target_path"].strip().replace("/", os.sep)
     target_abs_path = os.path.abspath(os.path.join(directory, target_rel_path))
-    if not target_abs_path.startswith(directory):
+    if not is_safe_path(directory, target_abs_path):
         logging.warning(f"Unauthorized upload path: {target_abs_path}")
         flash("Unauthorized upload path.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
+    file_path = os.path.abspath(os.path.join(target_abs_path, filename))
+    if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
+        logging.warning(f"Unauthorized upload file path: {file_path}")
+        flash("Unauthorized upload path.", "danger")
+        return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
     os.makedirs(target_abs_path, exist_ok=True)
-    file_path = os.path.join(target_abs_path, file.filename)
     if os.path.exists(file_path):
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            base, ext = os.path.splitext(file.filename)
+            base, ext = os.path.splitext(filename)
             backup_filename = f"{base}.BAK_{timestamp}{ext}"
-            backup_path = os.path.join(target_abs_path, backup_filename)
-            shutil.move(file_path, backup_path)
-            logging.info(f"Existing file backed up to: {backup_filename}")
-            flash(f"Existing file '{file.filename}' was backed up (versioned).", "warning")
+            backup_path = os.path.abspath(os.path.join(target_abs_path, backup_filename))
+            if is_safe_path(target_abs_path, backup_path):
+                shutil.move(file_path, backup_path)
+                logging.info(f"Existing file backed up to: {backup_filename}")
+                flash(f"Existing file '{filename}' was backed up (versioned).", "warning")
         except Exception as e:
-            logging.error(f"Failed to backup existing file {file.filename}: {e}")
+            logging.error(f"Failed to backup existing file {filename}: {e}")
             flash("Failed to create file backup. Upload aborted.", "danger")
             return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
     file.save(file_path)
-    logging.info(f"File uploaded to {target_abs_path}: {file.filename} ({file_size_mb:.2f} MB)")
-    flash(f"File '{file.filename}' successfully uploaded.", "success")
+    logging.info(f"File uploaded to {target_abs_path}: {filename} ({file_size_mb:.2f} MB)")
+    flash(f"File '{filename}' successfully uploaded.", "success")
     return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
 
 @app.route("/delete", methods=["POST"])
@@ -5250,7 +5656,7 @@ def bulk_delete():
     for file_rel in files:
         file_to_delete_rel = file_rel.lstrip("/\\").rstrip("/\\")
         file_to_delete_abs = os.path.abspath(os.path.join(directory, file_to_delete_rel))
-        if not file_to_delete_abs.startswith(directory) or not os.path.exists(file_to_delete_abs):
+        if not is_safe_path(directory, file_to_delete_abs) or not os.path.exists(file_to_delete_abs):
             error_count += 1
             continue
             
@@ -5296,8 +5702,12 @@ def bulk_compress():
             flash("Incorrect PIN! Access denied.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
         
-    if not output_name.lower().endswith(".zip"):
-        output_name += ".zip"
+    sanitized_output = get_secure_filename(output_name)
+    if not sanitized_output:
+        flash("Invalid output file name.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
+    if not sanitized_output.lower().endswith(".zip"):
+        sanitized_output += ".zip"
         
     try:
         files = json.loads(files_json)
@@ -5306,20 +5716,26 @@ def bulk_compress():
         return redirect(url_for("list_files", req_path=current_path_rel))
         
     current_dir_abs = os.path.abspath(os.path.join(directory, current_path_rel))
-    output_abs = os.path.join(current_dir_abs, output_name)
+    if not is_safe_path(directory, current_dir_abs):
+        flash("Operation not allowed.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
+    output_abs = os.path.abspath(os.path.join(current_dir_abs, sanitized_output))
+    if not is_safe_path(current_dir_abs, output_abs) or not is_safe_path(directory, output_abs):
+        flash("Operation not allowed.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
     
     if os.path.exists(output_abs):
-        flash(f"File '{output_name}' already exists. Delete the existing file first.", "danger")
+        flash(f"File '{sanitized_output}' already exists. Delete the existing file first.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
         
     try:
         with zipfile.ZipFile(output_abs, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for file_rel in files:
                 target_abs = os.path.abspath(os.path.join(directory, file_rel.lstrip("/\\").rstrip("/\\")))
-                if target_abs.startswith(directory) and os.path.exists(target_abs):
+                if is_safe_path(directory, target_abs) and os.path.exists(target_abs):
                     zip_folder_or_file(target_abs, zipf, os.path.dirname(target_abs))
                     
-        flash(f"Successfully compressed {len(files)} item(s) to '{output_name}'.", "success")
+        flash(f"Successfully compressed {len(files)} item(s) to '{sanitized_output}'.", "success")
         logging.info(f"Bulk compression completed to {output_abs}")
     except Exception as e:
         logging.error(f"Bulk compression failed: {e}")
@@ -5349,8 +5765,7 @@ def rename_file():
     if current_path_rel == ".":
         current_path_rel = ""
 
-
-    if not old_file_abs.startswith(directory):
+    if not is_safe_path(directory, old_file_abs):
         logging.warning(f"Unauthorized renaming attempt outside the allowed directory: {old_file_abs}")
         flash("Operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5358,16 +5773,25 @@ def rename_file():
         flash("File or directory not found.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     try:
+        sanitized_name = get_secure_filename(new_name_base)
+        if not sanitized_name:
+            flash("Invalid new name.", "danger")
+            return redirect(url_for("list_files", req_path=current_path_rel))
         if os.path.isfile(old_file_abs):
             _, old_ext = os.path.splitext(os.path.basename(old_file_abs))
-            new_name_root, _ = os.path.splitext(new_name_base)
+            new_name_root, _ = os.path.splitext(sanitized_name)
             final_new_name = new_name_root + old_ext
         elif os.path.isdir(old_file_abs):
-            final_new_name = new_name_base
+            final_new_name = sanitized_name
         else:
             flash("Cannot rename, path is not a file or directory.", "danger")
             return redirect(url_for("list_files", req_path=current_path_rel))
-        new_name_abs = os.path.join(os.path.dirname(old_file_abs), final_new_name)
+        parent_dir = os.path.dirname(old_file_abs)
+        new_name_abs = os.path.abspath(os.path.join(parent_dir, final_new_name))
+        if not is_safe_path(parent_dir, new_name_abs) or not is_safe_path(directory, new_name_abs):
+            logging.warning(f"Unauthorized renaming destination: {new_name_abs}")
+            flash("Operation not allowed.", "danger")
+            return redirect(url_for("list_files", req_path=current_path_rel))
         if os.path.exists(new_name_abs):
              flash(f"A file or directory named '{final_new_name}' already exists.", "danger")
              return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5382,18 +5806,27 @@ def rename_file():
 @app.route("/new_folder", methods=["POST"])
 @login_required
 def new_folder():
-    folder_name = request.form.get("folder_name")
+    raw_folder_name = request.form.get("folder_name", "")
     pin = request.form.get("pin")
     target_rel_path = request.form.get("target_path", "").replace("/", os.sep)
-    if not folder_name or not pin:
+    if not raw_folder_name or not pin:
         flash("Folder name and PIN must be included.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
     if not session.get("edit_mode_active") and pin != edit_pin:
         logging.warning(f"Incorrect PIN for creating a folder: {pin}")
         flash("Incorrect PIN! Access denied.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
-    target_abs_path = os.path.abspath(os.path.join(directory, target_rel_path, folder_name))
-    if not target_abs_path.startswith(os.path.abspath(directory)):
+    folder_name = get_secure_filename(raw_folder_name)
+    if not folder_name:
+        flash("Invalid folder name.", "danger")
+        return redirect(url_for("list_files", req_path=target_rel_path))
+    parent_abs_path = os.path.abspath(os.path.join(directory, target_rel_path))
+    if not is_safe_path(directory, parent_abs_path):
+        logging.warning(f"Attempt to create folder outside the allowed directory: {parent_abs_path}")
+        flash("Operation not allowed.", "danger")
+        return redirect(url_for("list_files", req_path=target_rel_path))
+    target_abs_path = os.path.abspath(os.path.join(parent_abs_path, folder_name))
+    if not is_safe_path(parent_abs_path, target_abs_path) or not is_safe_path(directory, target_abs_path):
         logging.warning(f"Attempt to create folder outside the allowed directory: {target_abs_path}")
         flash("Operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
@@ -5429,11 +5862,11 @@ def move_file():
     if destination_rel_cleaned.startswith(os.path.basename(directory)):
         destination_rel_cleaned = destination_rel_cleaned[len(os.path.basename(directory)) + 1:].lstrip("/").lstrip("\\")
     destination_abs = os.path.abspath(os.path.join(directory, destination_rel_cleaned))
-    if not source_abs.startswith(directory) or not os.path.exists(source_abs):
+    if not is_safe_path(directory, source_abs) or not os.path.exists(source_abs):
         logging.warning(f"Unauthorized move source or source not found: {source_abs}")
         flash("Source file/folder not found or operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
-    if not destination_abs.startswith(directory):
+    if not is_safe_path(directory, destination_abs):
         logging.warning(f"Unauthorized move destination outside the allowed directory: {destination_abs}")
         flash("Destination folder not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5442,7 +5875,10 @@ def move_file():
         flash(f"Destination folder '{destination_rel_cleaned if destination_rel_cleaned else '/'}' does not exist.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     target_name = os.path.basename(source_abs)
-    target_abs = os.path.join(destination_abs, target_name)
+    target_abs = os.path.abspath(os.path.join(destination_abs, target_name))
+    if not is_safe_path(destination_abs, target_abs) or not is_safe_path(directory, target_abs):
+        flash("Destination folder not allowed.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
     if os.path.exists(target_abs):
         flash(f"Cannot move: A file/folder named '{target_name}' already exists in the destination.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5478,17 +5914,26 @@ def compress_file():
     target_abs = os.path.abspath(os.path.join(directory, target_rel))
     current_dir_abs = os.path.dirname(target_abs)
     current_path_rel = os.path.dirname(target_rel).replace(os.sep, "/")
-    if not target_abs.startswith(directory) or not os.path.exists(target_abs):
+    if not is_safe_path(directory, target_abs) or not os.path.exists(target_abs):
         flash("File or folder not found or operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
-    output_abs = os.path.join(current_dir_abs, output_name)
+    sanitized_output = get_secure_filename(output_name)
+    if not sanitized_output:
+        flash("Invalid output file name.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
+    if not sanitized_output.lower().endswith(".zip"):
+        sanitized_output += ".zip"
+    output_abs = os.path.abspath(os.path.join(current_dir_abs, sanitized_output))
+    if not is_safe_path(current_dir_abs, output_abs) or not is_safe_path(directory, output_abs):
+        flash("Operation not allowed.", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
     if os.path.exists(output_abs):
-        flash(f"File '{output_name}' already exists. Delete the existing file first.", "danger")
+        flash(f"File '{sanitized_output}' already exists. Delete the existing file first.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     try:
         with zipfile.ZipFile(output_abs, 'w', zipfile.ZIP_DEFLATED) as zipf:
             zip_folder_or_file(target_abs, zipf, os.path.dirname(target_abs))
-            flash(f"'{os.path.basename(target_abs)}' successfully compressed to '{output_name}'.", "success")
+            flash(f"'{os.path.basename(target_abs)}' successfully compressed to '{sanitized_output}'.", "success")
             logging.info(f"Item compressed: {target_abs} to {output_abs}")
     except Exception as e:
         logging.error(f"Compression failed for {target_rel}: {e}")
@@ -5514,10 +5959,10 @@ def extract_file():
     archive_abs = os.path.abspath(os.path.join(directory, archive_rel))
     destination_abs = os.path.abspath(os.path.join(directory, destination_rel))
     current_path_rel = os.path.dirname(archive_rel).replace(os.sep, "/")
-    if not archive_abs.startswith(directory) or not os.path.exists(archive_abs) or not os.path.isfile(archive_abs):
+    if not is_safe_path(directory, archive_abs) or not os.path.exists(archive_abs) or not os.path.isfile(archive_abs):
         flash("Archive file not found or operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
-    if not destination_abs.startswith(directory):
+    if not is_safe_path(directory, destination_abs):
         flash("Destination folder not allowed (must be inside shared directory).", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     if not os.path.exists(destination_abs):
@@ -5533,7 +5978,7 @@ def extract_file():
                 if sanitized_member.startswith('..'):
                     raise Exception("Path traversal detected.")
                 member_path = os.path.abspath(os.path.join(destination_abs, sanitized_member))
-                if not member_path.startswith(destination_abs):
+                if not is_safe_path(destination_abs, member_path) or not is_safe_path(directory, member_path):
                     flash("Archive contains files that try to extract outside the destination. Extraction aborted.", "danger")
                     logging.error(f"Zip Slip attempt detected in archive: {archive_rel}")
                     return redirect(url_for("list_files", req_path=current_path_rel))
