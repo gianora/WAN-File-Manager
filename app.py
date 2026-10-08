@@ -65,9 +65,12 @@ def is_safe_path(base_dir, path, follow_symlinks=True):
         else:
             matchpath = os.path.abspath(path)
             base = os.path.abspath(base_dir)
-        return base == matchpath or matchpath.startswith(base + os.sep)
+        norm_match = os.path.normcase(matchpath)
+        norm_base = os.path.normcase(base)
+        return norm_base == norm_match or norm_match.startswith(norm_base + os.sep)
     except Exception:
         return False
+
 def get_secure_filename(filename):
     """Sanitasi nama file dari Path Traversal (CWE-22) dengan fallback karakter UTF-8."""
     if not filename:
@@ -171,42 +174,68 @@ def set_setting(key, value):
 init_db_and_migrate()
 
 host = get_setting("host", "0.0.0.0")
-port = int(get_setting("port", "5000"))
+try:
+    port = int(get_setting("port", "5000"))
+    if not (1 <= port <= 65535):
+        port = 5000
+except (ValueError, TypeError):
+    port = 5000
 raw_dir = get_setting("directory", "shared_files").strip()
 directory = raw_dir if raw_dir else "shared_files"
 upload_pin = get_setting("upload_pin", "1234")
 login_pin = get_setting("login_pin", "4321")
 edit_pin = get_setting("edit_pin", "5678")
 raw_extensions = get_setting("allowed_extensions", ".txt,.jpg,.png")
-ALLOWED_EXTENSIONS = set(ext.strip().lower() for ext in raw_extensions.split(",") if ext.strip().startswith("."))
+ALLOWED_EXTENSIONS = set(
+    (ext.strip().lower() if ext.strip().startswith(".") else "." + ext.strip().lower())
+    for ext in raw_extensions.split(",")
+    if ext.strip()
+)
 
 tg_bot_token = get_setting("tg_bot_token", "")
 tg_chat_id = get_setting("tg_chat_id", "")
 tg_enabled = get_setting("tg_enabled", "False").lower() in ["true", "1", "yes"]
 
 directory = os.path.abspath(directory)
-os.makedirs(directory, exist_ok=True)
+try:
+    os.makedirs(directory, exist_ok=True)
+except Exception as e:
+    logging.error(f"Failed to create directory {directory}: {e}")
 
 def reload_global_settings():
     global host, port, directory, upload_pin, login_pin, edit_pin, raw_extensions, ALLOWED_EXTENSIONS
     global tg_bot_token, tg_chat_id, tg_enabled
     
     host = get_setting("host", "0.0.0.0")
-    port = int(get_setting("port", "5000"))
+    try:
+        raw_port = int(get_setting("port", "5000"))
+        if 1 <= raw_port <= 65535:
+            port = raw_port
+        else:
+            port = 5000
+    except (ValueError, TypeError):
+        port = 5000
     raw_dir = get_setting("directory", "shared_files").strip()
     directory = raw_dir if raw_dir else "shared_files"
     upload_pin = get_setting("upload_pin", "1234")
     login_pin = get_setting("login_pin", "4321")
     edit_pin = get_setting("edit_pin", "5678")
     raw_extensions = get_setting("allowed_extensions", ".txt,.jpg,.png")
-    ALLOWED_EXTENSIONS = set(ext.strip().lower() for ext in raw_extensions.split(",") if ext.strip().startswith("."))
+    ALLOWED_EXTENSIONS = set(
+        (ext.strip().lower() if ext.strip().startswith(".") else "." + ext.strip().lower())
+        for ext in raw_extensions.split(",")
+        if ext.strip()
+    )
     
     tg_bot_token = get_setting("tg_bot_token", "")
     tg_chat_id = get_setting("tg_chat_id", "")
     tg_enabled = get_setting("tg_enabled", "False").lower() in ["true", "1", "yes"]
     
     directory = os.path.abspath(directory)
-    os.makedirs(directory, exist_ok=True)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception as e:
+        logging.error(f"Failed to create directory {directory}: {e}")
 
 def is_allowed_extension(ext, allow_zip=False):
     ext = ext.lower()
@@ -394,13 +423,28 @@ def send_telegram_otp(otp, remote_ip, browser_info="N/A"):
     threading.Thread(target=_send, daemon=True).start()
     return True
 
+_otp_ip_cooldown = {}
+_otp_ip_lock = threading.Lock()
+
 @app.route("/request_telegram_otp", methods=["POST"])
 def request_telegram_otp():
     if not tg_enabled or not tg_bot_token or not tg_chat_id:
         return jsonify({"success": False, "message": "Telegram login is not configured on the server."})
     
-    last_req = session.get("last_otp_request_time")
     now_ts = time.time()
+    client_ip = get_real_client_ip()
+    with _otp_ip_lock:
+        if len(_otp_ip_cooldown) > 1000:
+            expired_ips = [ip for ip, t in _otp_ip_cooldown.items() if now_ts - t > 60]
+            for ip in expired_ips:
+                _otp_ip_cooldown.pop(ip, None)
+        last_ip_time = _otp_ip_cooldown.get(client_ip, 0)
+        if (now_ts - last_ip_time) < 30:
+            remaining = int(30 - (now_ts - last_ip_time))
+            return jsonify({"success": False, "message": f"Please wait {remaining} seconds before requesting a new code."})
+        _otp_ip_cooldown[client_ip] = now_ts
+
+    last_req = session.get("last_otp_request_time")
     if last_req and (now_ts - last_req) < 30:
         remaining = int(30 - (now_ts - last_req))
         return jsonify({"success": False, "message": f"Please wait {remaining} seconds before requesting a new code."})
@@ -413,7 +457,6 @@ def request_telegram_otp():
     session["login_otp"] = otp
     session["login_otp_expiry"] = expiry.strftime("%Y-%m-%d %H:%M:%S")
     
-    client_ip = get_real_client_ip()
     user_agent = request.headers.get('User-Agent', 'Unknown Browser')
     
     if send_telegram_otp(otp, client_ip, user_agent):
@@ -422,43 +465,53 @@ def request_telegram_otp():
         return jsonify({"success": False, "message": "Failed to send OTP. Please contact admin."})
     
 
-def zip_folder_or_file(source_path, ziph, base_dir_for_zip):
+def zip_folder_or_file(source_path, ziph, base_dir_for_zip=None):
     source_path = os.path.abspath(source_path)
+    base_dir_to_use = base_dir_for_zip if base_dir_for_zip else os.path.dirname(source_path)
     if os.path.isfile(source_path):
         ziph.write(source_path, os.path.basename(source_path))
     elif os.path.isdir(source_path):
         for root, dirs, files in os.walk(source_path):
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            base_dir_to_use = os.path.dirname(source_path) 
             for file in files:
                 if file.startswith('.'):
                     continue
                 file_path = os.path.join(root, file)
+                if hasattr(ziph, 'filename') and ziph.filename and os.path.abspath(file_path) == os.path.abspath(ziph.filename):
+                    continue
                 rel_path_in_zip = os.path.relpath(file_path, base_dir_to_use)
                 ziph.write(file_path, rel_path_in_zip)
             for dir_name in dirs:
                 dir_path = os.path.join(root, dir_name)
                 rel_path_in_zip = os.path.relpath(dir_path, base_dir_to_use)
-                if not os.listdir(dir_path):
-                    zipInfo = zipfile.ZipInfo(rel_path_in_zip.replace('\\', '/') + '/')
-                    ziph.writestr(zipInfo, '')
+                try:
+                    if not os.listdir(dir_path):
+                        zipInfo = zipfile.ZipInfo(rel_path_in_zip.replace('\\', '/') + '/')
+                        ziph.writestr(zipInfo, '')
+                except OSError:
+                    pass
 
 def get_file_info(file_path):
-    size = os.path.getsize(file_path) / (1024 * 1024)
-    version = "-"
-    created_time = os.path.getctime(file_path)
-    created_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_time))
-    if platform.system() == "Windows" and file_path.lower().endswith((".exe", ".dll")):
-        try:
-            import win32api
-            info = win32api.GetFileVersionInfo(file_path, "\\")
-            ms, ls = info['FileVersionMS'], info['FileVersionLS']
-            version = f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
-        except KeyError:
-            version = "Not available"
-        except Exception as e:
-            logging.warning(f"Error reading file version {file_path}: {e}")
-    return f"{size:.2f} MB", version, created_date
+    try:
+        size = os.path.getsize(file_path) / (1024 * 1024)
+        version = "-"
+        created_time = os.path.getctime(file_path)
+        created_date = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_time))
+        if platform.system() == "Windows" and file_path.lower().endswith((".exe", ".dll")):
+            try:
+                import win32api
+                info = win32api.GetFileVersionInfo(file_path, "\\")
+                ms, ls = info['FileVersionMS'], info['FileVersionLS']
+                version = f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+            except KeyError:
+                version = "Not available"
+            except Exception as e:
+                logging.warning(f"Error reading file version {file_path}: {e}")
+        return f"{size:.2f} MB", version, created_date
+    except Exception as e:
+        logging.warning(f"Error reading file info {file_path}: {e}")
+        return "- MB", "-", "-"
+
 
 def login_required(f):
     @wraps(f)
@@ -879,12 +932,18 @@ def upload_request_chunk(token):
     
     file_chunk = request.files.get("file")
     raw_filename = request.form.get("filename")
-    chunk_index = int(request.form.get("chunk_index", 0))
-    total_chunks = int(request.form.get("total_chunks", 1))
     raw_upload_id = request.form.get("upload_id")
 
     if not file_chunk or not raw_filename or not raw_upload_id:
         return jsonify({"success": False, "message": "Missing required upload parameters."}), 400
+
+    try:
+        chunk_index = int(request.form.get("chunk_index", 0))
+        total_chunks = int(request.form.get("total_chunks", 1))
+        if chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks:
+            return jsonify({"success": False, "message": "Invalid chunk parameters."}), 400
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "message": "Invalid chunk parameters."}), 400
 
     filename = get_secure_filename(raw_filename)
     if not filename:
@@ -901,6 +960,8 @@ def upload_request_chunk(token):
     target_abs_path = os.path.abspath(os.path.join(directory, target_rel_path))
     if not is_safe_path(directory, target_abs_path):
         return jsonify({"success": False, "message": "Unauthorized upload path."}), 403
+    if os.path.exists(target_abs_path) and not os.path.isdir(target_abs_path):
+        return jsonify({"success": False, "message": "Target path is not a directory."}), 400
 
     file_path = os.path.abspath(os.path.join(target_abs_path, filename))
     if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
@@ -923,6 +984,10 @@ def upload_request_chunk(token):
     file_chunk.save(chunk_path)
     
     if chunk_index == total_chunks - 1:
+        for i in range(total_chunks):
+            if not os.path.exists(os.path.join(upload_temp_dir, f"{i}.part")):
+                return jsonify({"success": False, "message": f"Incomplete upload: missing chunk {i}."}), 400
+
         if os.path.exists(file_path):
             try:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -942,12 +1007,13 @@ def upload_request_chunk(token):
                 for i in range(total_chunks):
                     part_path = os.path.join(upload_temp_dir, f"{i}.part")
                     with open(part_path, "rb") as part_file:
-                        final_file.write(part_file.read())
+                        shutil.copyfileobj(part_file, final_file)
             
             shutil.rmtree(upload_temp_dir, ignore_errors=True)
-            link_info["used"] = True
-            links[token] = link_info
-            save_shared_upload_links(links)
+            current_links = load_shared_upload_links()
+            if token in current_links:
+                current_links[token]["used"] = True
+                save_shared_upload_links(current_links)
             logging.info(f"Chunked file uploaded via link: {filename} to {target_abs_path}")
             return jsonify({"success": True, "message": f"File '{filename}' uploaded successfully."})
         except Exception as e:
@@ -959,6 +1025,7 @@ def upload_request_chunk(token):
 
     return jsonify({"success": True, "message": f"Chunk {chunk_index + 1}/{total_chunks} received."})
 
+
 @app.route("/upload_chunk", methods=["POST"])
 @login_required
 def upload_chunk():
@@ -969,13 +1036,19 @@ def upload_chunk():
 
     file_chunk = request.files.get("file")
     raw_filename = request.form.get("filename")
-    chunk_index = int(request.form.get("chunk_index", 0))
-    total_chunks = int(request.form.get("total_chunks", 1))
     target_path = request.form.get("target_path", "").strip().replace("/", os.sep)
     raw_upload_id = request.form.get("upload_id")
 
     if not file_chunk or not raw_filename or not raw_upload_id:
         return jsonify({"success": False, "message": "Missing required upload parameters."}), 400
+
+    try:
+        chunk_index = int(request.form.get("chunk_index", 0))
+        total_chunks = int(request.form.get("total_chunks", 1))
+        if chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks:
+            return jsonify({"success": False, "message": "Invalid chunk parameters."}), 400
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "message": "Invalid chunk parameters."}), 400
 
     filename = get_secure_filename(raw_filename)
     if not filename:
@@ -992,6 +1065,8 @@ def upload_chunk():
     target_abs_path = os.path.abspath(os.path.join(directory, target_path))
     if not is_safe_path(directory, target_abs_path):
         return jsonify({"success": False, "message": "Unauthorized upload path."}), 403
+    if os.path.exists(target_abs_path) and not os.path.isdir(target_abs_path):
+        return jsonify({"success": False, "message": "Target path is not a directory."}), 400
 
     file_path = os.path.abspath(os.path.join(target_abs_path, filename))
     if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
@@ -1014,6 +1089,10 @@ def upload_chunk():
     file_chunk.save(chunk_path)
     
     if chunk_index == total_chunks - 1:
+        for i in range(total_chunks):
+            if not os.path.exists(os.path.join(upload_temp_dir, f"{i}.part")):
+                return jsonify({"success": False, "message": f"Incomplete upload: missing chunk {i}."}), 400
+
         if os.path.exists(file_path):
             try:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1027,13 +1106,14 @@ def upload_chunk():
                 logging.error(f"Failed to backup existing file {filename}: {e}")
                 shutil.rmtree(upload_temp_dir, ignore_errors=True)
                 return jsonify({"success": False, "message": "Failed to backup existing file."}), 500
+
         
         try:
             with open(file_path, "wb") as final_file:
                 for i in range(total_chunks):
                     part_path = os.path.join(upload_temp_dir, f"{i}.part")
                     with open(part_path, "rb") as part_file:
-                        final_file.write(part_file.read())
+                        shutil.copyfileobj(part_file, final_file)
             
             shutil.rmtree(upload_temp_dir, ignore_errors=True)
             logging.info(f"Chunked file uploaded: {filename} to {target_abs_path}")
@@ -1160,12 +1240,14 @@ def is_link_expired(token_info):
     if not expiry:
         return False
     try:
-        expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
-        # Expiry is end of day
-        expiry_dt = expiry_dt.replace(hour=23, minute=59, second=59)
+        if " " in str(expiry):
+            expiry_dt = datetime.strptime(str(expiry), "%Y-%m-%d %H:%M:%S")
+        else:
+            expiry_dt = datetime.strptime(str(expiry), "%Y-%m-%d").replace(hour=23, minute=59, second=59)
         return datetime.now() > expiry_dt
     except Exception:
         return False
+
 
 # Public share route
 @app.route("/share/<token>", defaults={"subpath": ""})
@@ -1227,6 +1309,8 @@ def public_share(token, subpath=""):
     if os.path.isdir(target_abs_path):
         items = []
         for item in os.listdir(target_abs_path):
+            if item.startswith('.'):
+                continue
             item_path = os.path.join(target_abs_path, item)
             is_dir = os.path.isdir(item_path)
             size = "-"
@@ -1235,10 +1319,13 @@ def public_share(token, subpath=""):
                 if not is_allowed_extension(ext, allow_zip=True):
                     logging.warning(f"Public share: Hidden disallowed file: {item}")
                     continue
-                size_bytes = os.path.getsize(item_path)
-                if size_bytes < 1024: size = f"{size_bytes} B"
-                elif size_bytes < 1024*1024: size = f"{size_bytes/1024:.2f} KB"
-                else: size = f"{size_bytes/(1024*1024):.2f} MB"
+                try:
+                    size_bytes = os.path.getsize(item_path)
+                    if size_bytes < 1024: size = f"{size_bytes} B"
+                    elif size_bytes < 1024*1024: size = f"{size_bytes/1024:.2f} KB"
+                    else: size = f"{size_bytes/(1024*1024):.2f} MB"
+                except OSError:
+                    size = "-"
             
             item_rel = clean_subpath + "/" + item if clean_subpath else item
             items.append({
@@ -1274,9 +1361,10 @@ def public_share(token, subpath=""):
 
     # Single file sharing
     ext = os.path.splitext(target_abs_path)[1].lower()
-    if not is_allowed_extension(ext):
+    if not is_allowed_extension(ext, allow_zip=True):
         logging.warning(f"Public share: Blocked disallowed file: {clean_subpath}")
         abort(403)
+
     
     filename = os.path.basename(target_abs_path)
     file_size_bytes = os.path.getsize(target_abs_path)
@@ -1309,9 +1397,12 @@ def direct_download(token):
     
     if not is_safe_path(directory, abs_path) or not os.path.isfile(abs_path):
         abort(404)
+
+    if os.path.basename(abs_path).startswith('.'):
+        abort(403)
     
     ext = os.path.splitext(abs_path)[1].lower()
-    if not is_allowed_extension(ext):
+    if not is_allowed_extension(ext, allow_zip=True):
         abort(403)
         
     client_ip = get_real_client_ip()
@@ -1329,6 +1420,10 @@ def download_from_folder(token, filename):
         abort(404)
     
     if is_link_expired(links[token]):
+        abort(403)
+
+    clean_filename = filename.replace("\\", "/").strip("/")
+    if any(p.startswith(".") for p in clean_filename.split("/")):
         abort(403)
     
     # Jalur folder utama yang di-share
@@ -1398,7 +1493,10 @@ def zip_folder(token, subpath=""):
     try:
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for root, dirs, files_in_dir in os.walk(target_abs_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
                 for file in files_in_dir:
+                    if file.startswith('.'):
+                        continue
                     ext = os.path.splitext(file)[1].lower()
                     if not is_allowed_extension(ext, allow_zip=True):
                         continue
@@ -1426,7 +1524,8 @@ def zip_folder(token, subpath=""):
 
         file_size = os.path.getsize(temp_zip_path)
         resp = Response(stream_and_cleanup(), mimetype='application/zip')
-        resp.headers['Content-Disposition'] = f'attachment; filename="{zip_filename}"'
+        safe_header_filename = os.path.basename(zip_filename).replace('"', '')
+        resp.headers['Content-Disposition'] = f'attachment; filename="{safe_header_filename}"'
         resp.headers['Content-Length'] = str(file_size)
         return resp
     except Exception as e:
@@ -5188,7 +5287,7 @@ def get_network_config():
         try:
             if platform.system() == "Windows":
                 flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-                output = subprocess.check_output("ipconfig", text=True, creationflags=flags)
+                output = subprocess.check_output("ipconfig", text=True, encoding='utf-8', errors='replace', creationflags=flags)
                 for line in output.splitlines():
                     if "Default Gateway" in line or "Gerbang Default" in line:
                         parts = line.split(":")
@@ -5291,6 +5390,7 @@ if platform.system() == "Windows":
                 text=True,
                 check=True,
                 encoding='utf-8',
+                errors='replace',
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             logs = []
@@ -5635,6 +5735,9 @@ def upload_file():
         logging.warning(f"Unauthorized upload path: {target_abs_path}")
         flash("Unauthorized upload path.", "danger")
         return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
+    if os.path.exists(target_abs_path) and not os.path.isdir(target_abs_path):
+        flash("Target path is not a directory.", "danger")
+        return redirect(url_for("list_files", req_path=request.form.get("target_path", "")))
     file_path = os.path.abspath(os.path.join(target_abs_path, filename))
     if not is_safe_path(target_abs_path, file_path) or not is_safe_path(directory, file_path):
         logging.warning(f"Unauthorized upload file path: {file_path}")
@@ -5740,8 +5843,11 @@ def bulk_delete():
     
     for file_rel in files:
         file_to_delete_rel = file_rel.lstrip("/\\").rstrip("/\\")
+        if not file_to_delete_rel or file_to_delete_rel in [".", "/", "\\"]:
+            error_count += 1
+            continue
         file_to_delete_abs = os.path.abspath(os.path.join(directory, file_to_delete_rel))
-        if not is_safe_path(directory, file_to_delete_abs) or not os.path.exists(file_to_delete_abs):
+        if file_to_delete_abs == os.path.abspath(directory) or not is_safe_path(directory, file_to_delete_abs) or not os.path.exists(file_to_delete_abs):
             error_count += 1
             continue
             
@@ -5817,6 +5923,8 @@ def bulk_compress():
         with zipfile.ZipFile(output_abs, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for file_rel in files:
                 target_abs = os.path.abspath(os.path.join(directory, file_rel.lstrip("/\\").rstrip("/\\")))
+                if target_abs == output_abs or target_abs == os.path.abspath(directory):
+                    continue
                 if is_safe_path(directory, target_abs) and os.path.exists(target_abs):
                     zip_folder_or_file(target_abs, zipf, os.path.dirname(target_abs))
                     
@@ -5824,6 +5932,11 @@ def bulk_compress():
         logging.info(f"Bulk compression completed to {output_abs}")
     except Exception as e:
         logging.error(f"Bulk compression failed: {e}")
+        if os.path.exists(output_abs):
+            try:
+                os.remove(output_abs)
+            except Exception:
+                pass
         flash(f"Bulk compression failed: {e}", "danger")
         
     return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5850,8 +5963,8 @@ def rename_file():
     if current_path_rel == ".":
         current_path_rel = ""
 
-    if not is_safe_path(directory, old_file_abs):
-        logging.warning(f"Unauthorized renaming attempt outside the allowed directory: {old_file_abs}")
+    if old_file_abs == os.path.abspath(directory) or not is_safe_path(directory, old_file_abs):
+        logging.warning(f"Unauthorized renaming attempt: {old_file_abs}")
         flash("Operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     if not os.path.exists(old_file_abs):
@@ -5906,8 +6019,8 @@ def new_folder():
         flash("Invalid folder name.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
     parent_abs_path = os.path.abspath(os.path.join(directory, target_rel_path))
-    if not is_safe_path(directory, parent_abs_path):
-        logging.warning(f"Attempt to create folder outside the allowed directory: {parent_abs_path}")
+    if not is_safe_path(directory, parent_abs_path) or not os.path.isdir(parent_abs_path):
+        logging.warning(f"Attempt to create folder outside the allowed directory or non-folder: {parent_abs_path}")
         flash("Operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=target_rel_path))
     target_abs_path = os.path.abspath(os.path.join(parent_abs_path, folder_name))
@@ -5947,7 +6060,7 @@ def move_file():
     if destination_rel_cleaned.startswith(os.path.basename(directory)):
         destination_rel_cleaned = destination_rel_cleaned[len(os.path.basename(directory)) + 1:].lstrip("/").lstrip("\\")
     destination_abs = os.path.abspath(os.path.join(directory, destination_rel_cleaned))
-    if not is_safe_path(directory, source_abs) or not os.path.exists(source_abs):
+    if source_abs == os.path.abspath(directory) or not is_safe_path(directory, source_abs) or not os.path.exists(source_abs):
         logging.warning(f"Unauthorized move source or source not found: {source_abs}")
         flash("Source file/folder not found or operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
@@ -5999,7 +6112,7 @@ def compress_file():
     target_abs = os.path.abspath(os.path.join(directory, target_rel))
     current_dir_abs = os.path.dirname(target_abs)
     current_path_rel = os.path.dirname(target_rel).replace(os.sep, "/")
-    if not is_safe_path(directory, target_abs) or not os.path.exists(target_abs):
+    if target_abs == os.path.abspath(directory) or not is_safe_path(directory, target_abs) or not os.path.exists(target_abs):
         flash("File or folder not found or operation not allowed.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     sanitized_output = get_secure_filename(output_name)
@@ -6022,6 +6135,11 @@ def compress_file():
             logging.info(f"Item compressed: {target_abs} to {output_abs}")
     except Exception as e:
         logging.error(f"Compression failed for {target_rel}: {e}")
+        if os.path.exists(output_abs):
+            try:
+                os.remove(output_abs)
+            except Exception:
+                pass
         flash(f"Compression failed: {e}", "danger")
     return redirect(url_for("list_files", req_path=current_path_rel))
 
@@ -6049,6 +6167,9 @@ def extract_file():
         return redirect(url_for("list_files", req_path=current_path_rel))
     if not is_safe_path(directory, destination_abs):
         flash("Destination folder not allowed (must be inside shared directory).", "danger")
+        return redirect(url_for("list_files", req_path=current_path_rel))
+    if os.path.exists(destination_abs) and not os.path.isdir(destination_abs):
+        flash("Destination must be a folder, not a file.", "danger")
         return redirect(url_for("list_files", req_path=current_path_rel))
     if not os.path.exists(destination_abs):
         try:
@@ -6350,7 +6471,15 @@ def settings_dashboard():
         
     if request.method == 'POST':
         set_setting('host', request.form.get('host', '0.0.0.0'))
-        set_setting('port', request.form.get('port', '5000'))
+        raw_port = request.form.get('port', '5000').strip()
+        try:
+            val_port = int(raw_port)
+            if 1 <= val_port <= 65535:
+                set_setting('port', str(val_port))
+            else:
+                flash("Port must be between 1 and 65535; previous port retained.", "warning")
+        except ValueError:
+            flash("Invalid port number; previous port retained.", "warning")
         new_dir = request.form.get('directory', '').strip()
         if not new_dir:
             new_dir = 'shared_files'
@@ -6415,10 +6544,11 @@ def save_text():
         content = ""
         
     clean_req_path = req_path.lstrip("/\\")
-    base_dir = get_setting('directory', 'shared_files')
-    abs_path = os.path.abspath(os.path.join(base_dir, clean_req_path))
-    if not is_safe_path(base_dir, abs_path):
+    abs_path = os.path.abspath(os.path.join(directory, clean_req_path))
+    if not is_safe_path(directory, abs_path) or abs_path == os.path.abspath(directory):
         return jsonify({'success': False, 'message': 'Unauthorized path'}), 403
+    if os.path.isdir(abs_path):
+        return jsonify({'success': False, 'message': 'Target path is a directory'}), 400
         
     _, ext = os.path.splitext(abs_path)
     if not is_allowed_extension(ext):
