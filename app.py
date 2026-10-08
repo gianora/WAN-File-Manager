@@ -84,7 +84,9 @@ def get_secure_filename(filename):
     return safe_chars.strip(' ._')
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -328,7 +330,7 @@ def send_login_notification(status, remote_ip, browser_info="N/A"):
             
             safe_ip = html.escape(remote_ip)
             safe_browser = html.escape(browser_info)
-            icon = "✅" if status == "SUCCESS✅" else "⚠️"
+            icon = "✅" if "SUCCESS" in status else "❌"
             
             # Focused on browser access location/identity
             message = (
@@ -397,6 +399,13 @@ def request_telegram_otp():
     if not tg_enabled or not tg_bot_token or not tg_chat_id:
         return jsonify({"success": False, "message": "Telegram login is not configured on the server."})
     
+    last_req = session.get("last_otp_request_time")
+    now_ts = time.time()
+    if last_req and (now_ts - last_req) < 30:
+        remaining = int(30 - (now_ts - last_req))
+        return jsonify({"success": False, "message": f"Please wait {remaining} seconds before requesting a new code."})
+    session["last_otp_request_time"] = now_ts
+    
     # Generate 6-digit OTP
     otp = "".join([str(secrets.randbelow(10)) for _ in range(6)])
     expiry = datetime.now() + timedelta(minutes=5)
@@ -419,8 +428,11 @@ def zip_folder_or_file(source_path, ziph, base_dir_for_zip):
         ziph.write(source_path, os.path.basename(source_path))
     elif os.path.isdir(source_path):
         for root, dirs, files in os.walk(source_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
             base_dir_to_use = os.path.dirname(source_path) 
             for file in files:
+                if file.startswith('.'):
+                    continue
                 file_path = os.path.join(root, file)
                 rel_path_in_zip = os.path.relpath(file_path, base_dir_to_use)
                 ziph.write(file_path, rel_path_in_zip)
@@ -458,43 +470,49 @@ def login_required(f):
 
 # Shared links
 SHARED_LINKS_FILE = os.path.join(APP_DIR, "shared_links.json")
+shared_links_lock = threading.Lock()
 
 def load_shared_links():
-    if os.path.exists(SHARED_LINKS_FILE):
-        try:
-            with open(SHARED_LINKS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Error loading {SHARED_LINKS_FILE}: {e}")
-            return {}
-    return {}
+    with shared_links_lock:
+        if os.path.exists(SHARED_LINKS_FILE):
+            try:
+                with open(SHARED_LINKS_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.error(f"Error loading {SHARED_LINKS_FILE}: {e}")
+                return {}
+        return {}
 
 def save_shared_links(links):
-    try:
-        with open(SHARED_LINKS_FILE, "w") as f:
-            json.dump(links, f)
-    except Exception as e:
-        logging.error(f"Error saving {SHARED_LINKS_FILE}: {e}")
+    with shared_links_lock:
+        try:
+            with open(SHARED_LINKS_FILE, "w") as f:
+                json.dump(links, f)
+        except Exception as e:
+            logging.error(f"Error saving {SHARED_LINKS_FILE}: {e}")
 
 # Shared upload links
 SHARED_UPLOAD_LINKS_FILE = os.path.join(APP_DIR, "shared_upload_links.json")
+shared_upload_links_lock = threading.Lock()
 
 def load_shared_upload_links():
-    if os.path.exists(SHARED_UPLOAD_LINKS_FILE):
-        try:
-            with open(SHARED_UPLOAD_LINKS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Error loading {SHARED_UPLOAD_LINKS_FILE}: {e}")
-            return {}
-    return {}
+    with shared_upload_links_lock:
+        if os.path.exists(SHARED_UPLOAD_LINKS_FILE):
+            try:
+                with open(SHARED_UPLOAD_LINKS_FILE, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.error(f"Error loading {SHARED_UPLOAD_LINKS_FILE}: {e}")
+                return {}
+        return {}
 
 def save_shared_upload_links(links):
-    try:
-        with open(SHARED_UPLOAD_LINKS_FILE, "w") as f:
-            json.dump(links, f)
-    except Exception as e:
-        logging.error(f"Error saving {SHARED_UPLOAD_LINKS_FILE}: {e}")
+    with shared_upload_links_lock:
+        try:
+            with open(SHARED_UPLOAD_LINKS_FILE, "w") as f:
+                json.dump(links, f)
+        except Exception as e:
+            logging.error(f"Error saving {SHARED_UPLOAD_LINKS_FILE}: {e}")
 
 UPLOAD_REQUEST_TEMPLATE = """
 <!DOCTYPE html>
@@ -5549,6 +5567,8 @@ def list_files(req_path):
         abort(404)
     file_list = []
     for item in os.listdir(abs_path):
+        if item.startswith('.'):
+            continue
         item_path = os.path.join(abs_path, item)
         rel_path = os.path.relpath(item_path, directory).replace("\\", "/")
         if os.path.isdir(item_path):
@@ -6038,15 +6058,32 @@ def extract_file():
             return redirect(url_for("list_files", req_path=current_path_rel))
     try:
         with zipfile.ZipFile(archive_abs, 'r') as zipf:
-            for member in zipf.namelist():
+            total_uncompressed = 0
+            for info in zipf.infolist():
+                total_uncompressed += info.file_size
+                member = info.filename
                 sanitized_member = os.path.normpath(member)
-                if sanitized_member.startswith('..'):
-                    raise Exception("Path traversal detected.")
+                if sanitized_member.startswith('..') or os.path.isabs(sanitized_member):
+                    flash("Path traversal detected in archive. Extraction aborted.", "danger")
+                    logging.error(f"Path traversal detected in archive: {archive_rel}")
+                    return redirect(url_for("list_files", req_path=current_path_rel))
                 member_path = os.path.abspath(os.path.join(destination_abs, sanitized_member))
                 if not is_safe_path(destination_abs, member_path) or not is_safe_path(directory, member_path):
                     flash("Archive contains files that try to extract outside the destination. Extraction aborted.", "danger")
                     logging.error(f"Zip Slip attempt detected in archive: {archive_rel}")
                     return redirect(url_for("list_files", req_path=current_path_rel))
+                if not member.endswith('/'):
+                    _, ext = os.path.splitext(sanitized_member)
+                    if not is_allowed_extension(ext, allow_zip=True):
+                        flash(f"Archive contains disallowed file type ({ext}). Extraction aborted.", "danger")
+                        logging.warning(f"Disallowed file type in archive: {member}")
+                        return redirect(url_for("list_files", req_path=current_path_rel))
+
+            if total_uncompressed > MAX_FILE_SIZE_MB * 1024 * 1024:
+                flash(f"Archive uncompressed size exceeds limit ({MAX_FILE_SIZE_MB} MB). Extraction aborted.", "danger")
+                logging.warning(f"Zip bomb rejected: {archive_rel} ({total_uncompressed} bytes)")
+                return redirect(url_for("list_files", req_path=current_path_rel))
+
             zipf.extractall(destination_abs)
             flash(f"Archive '{os.path.basename(archive_abs)}' successfully extracted to '{destination_rel}'.", "success")
             logging.info(f"Archive extracted: {archive_abs} to {destination_abs}")
@@ -6111,7 +6148,14 @@ def create_tray_icon():
             logging.error(f"Failed to generate dynamic tray image: {e}")
             image = Image.new("RGB", (64, 64), (0, 102, 204))
 
-    menu = Menu(MenuItem("Exit", exit_app))
+    import webbrowser
+    def open_browser(icon_instance, item):
+        webbrowser.open(f"http://localhost:{port}")
+
+    menu = Menu(
+        MenuItem("Open File Station", open_browser, default=True),
+        MenuItem("Exit", exit_app)
+    )
     icon = Icon("FileServer", image, menu=menu)
     icon.run()
 
