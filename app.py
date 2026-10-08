@@ -45,6 +45,17 @@ def get_app_dir():
 APP_DIR = get_app_dir()
 DB_FILE = os.path.join(APP_DIR, "settings.db")
 
+def get_resource_path(relative_path):
+    """Mencari file resource: prioritas di APP_DIR, fallback ke bundle PyInstaller (_MEIPASS)."""
+    local_path = os.path.join(APP_DIR, relative_path)
+    if os.path.exists(local_path):
+        return local_path
+    if hasattr(sys, '_MEIPASS'):
+        bundle_path = os.path.join(sys._MEIPASS, relative_path)
+        if os.path.exists(bundle_path):
+            return bundle_path
+    return local_path
+
 def is_safe_path(base_dir, path, follow_symlinks=True):
     """Memeriksa apakah path berada di dalam base_dir untuk mencegah Directory Traversal."""
     try:
@@ -5395,7 +5406,10 @@ def login():
 @app.route("/image.jpg")
 def serve_wallpaper():
     """Route to serve the macOS wallpaper background image"""
-    return send_from_directory(APP_DIR, 'image.jpg')
+    wallpaper_path = get_resource_path('image.jpg')
+    if os.path.exists(wallpaper_path):
+        return send_from_directory(os.path.dirname(wallpaper_path), os.path.basename(wallpaper_path))
+    abort(404)
 
 @app.route("/logout")
 def logout():
@@ -6050,7 +6064,7 @@ def run_server():
 def create_tray_icon():
     from pystray import Icon, MenuItem, Menu
     image = None
-    icon_path = os.path.join(APP_DIR, "icon.ico")
+    icon_path = get_resource_path("icon.ico")
     if os.path.exists(icon_path):
         try:
             image = Image.open(icon_path)
