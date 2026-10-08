@@ -39,6 +39,7 @@ shared_upload_links.json
 
 # Internal Development Docs & Scratch Scripts
 BUGFIX_AND_ROADMAP.md
+LAPORAN_AUDIT_BUGFIX.md
 CHANGELOG.md
 fix_modals.ps1
 background.jpg
